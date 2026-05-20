@@ -1,0 +1,78 @@
+@import "tailwindcss";
+
+/* 
+  CodeDNA global styles — Tailwind v4.
+  Only animation keyframes go here; everything else is Tailwind utility classes.
+*/
+
+@layer base {
+  :root {
+    color-scheme: dark;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  body {
+    @apply bg-zinc-950 text-zinc-100 antialiased;
+    font-family: 'Inter', system-ui, sans-serif;
+  }
+
+  /* Custom scrollbar for terminal-style panels */
+  ::-webkit-scrollbar {
+    width: 4px;
+  }
+  ::-webkit-scrollbar-track {
+    @apply bg-zinc-900;
+  }
+  ::-webkit-scrollbar-thumb {
+    @apply bg-zinc-600 rounded-full;
+  }
+}
+
+/* ─── Animations ──────────────────────────────────────────────────────────── */
+
+@keyframes timeline-entry {
+  from {
+    opacity: 0;
+    transform: translateX(-16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+@keyframes health-count {
+  from { opacity: 0; transform: scale(0.8); }
+  to   { opacity: 1; transform: scale(1);   }
+}
+
+@keyframes pulse-ring {
+  0%   { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.6); }
+  70%  { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(239, 68, 68, 0); }
+}
+
+@keyframes blink-cursor {
+  50% { opacity: 0; }
+}
+
+@keyframes fade-in {
+  from { opacity: 0; }
+  to   { opacity: 1; }
+}
+
+@keyframes slide-up {
+  from { opacity: 0; transform: translateY(12px); }
+  to   { opacity: 1; transform: translateY(0);    }
+}
+
+/* Expose animations as utility classes so TSX can reference them directly */
+.animate-timeline-entry  { animation: timeline-entry  0.4s ease-out forwards; }
+.animate-health-count    { animation: health-count    0.5s ease-out forwards; }
+.animate-pulse-ring      { animation: pulse-ring      1.5s ease-out infinite; }
+.animate-blink-cursor    { animation: blink-cursor    1s step-end infinite;   }
+.animate-fade-in         { animation: fade-in         0.3s ease-out forwards; }
+.animate-slide-up        { animation: slide-up        0.4s ease-out forwards; }
