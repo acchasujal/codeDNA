@@ -17,12 +17,14 @@ interface ReasoningPanelProps {
   gitLog:           string;
   isActive:         boolean;
   onStreamComplete: (finalText: string, errorMsg: string | null) => void;
+  onCached?:        () => void;
 }
 
 export default function ReasoningPanel({
   gitLog,
   isActive,
   onStreamComplete,
+  onCached,
 }: ReasoningPanelProps) {
   const [tokens, setTokens]           = useState<string>('');
   const [isDone, setIsDone]           = useState(false);
@@ -67,6 +69,10 @@ export default function ReasoningPanel({
         setIsConnecting(false);
         onStreamComplete(accumulatedTokensRef.current, msg);
       },
+      // onCached
+      () => {
+        if (onCached) onCached();
+      }
     );
 
     controllerRef.current = controller;

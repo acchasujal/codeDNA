@@ -20,6 +20,7 @@ interface HealthScoreProps {
   commitsAnalyzed: number;
   dataQuality:     'high' | 'medium' | 'low';
   breakdown:       HealthBreakdownItem[];
+  cached?:         boolean;
 }
 
 const QUALITY_CONFIG: Record<string, { label: string; cls: string }> = {
@@ -53,6 +54,7 @@ export default function HealthScore({
   commitsAnalyzed,
   dataQuality,
   breakdown,
+  cached,
 }: HealthScoreProps) {
   const [displayed, setDisplayed] = useState(0);
 
@@ -113,8 +115,17 @@ export default function HealthScore({
 
         {/* Summary stats */}
         <div className="flex-1 min-w-0">
-          <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-1.5 border-b border-zinc-900 pb-1.5">
-            DNA Health Report
+          <p className="text-[10px] font-mono text-zinc-500 uppercase tracking-widest mb-1.5 border-b border-zinc-900 pb-1.5 flex justify-between items-center">
+            <span>DNA Health Report</span>
+            {cached ? (
+              <span className="bg-emerald-500/10 text-emerald-400 px-1.5 py-0.5 rounded border border-emerald-500/20 font-bold tracking-widest">
+                Cached ✓
+              </span>
+            ) : (
+              <span className="text-zinc-600 tracking-widest">
+                Fresh Analysis
+              </span>
+            )}
           </p>
           <p className="text-[11px] font-mono text-zinc-300 leading-relaxed mb-3">
             {justification}

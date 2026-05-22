@@ -94,6 +94,9 @@ export interface AnalyzeResponse {
   fallback_level?:      number;       // 0 = primary, 1+ = degraded
   degraded_mode?:       boolean;      // true when fallback was triggered
   degraded_message?:    string;       // user-facing explanation
+  // v4: caching
+  cached?:              boolean;      // true if result was served from cache
+  cache_key?:           string;       // MD5 hash used for caching
 }
 
 export interface HealthResponse {
@@ -155,6 +158,7 @@ export function openThinkingStream(
   onToken: (text: string) => void,
   onDone:  () => void,
   onError: (msg: string) => void,
+  onCached?: () => void,
 ): AbortController {
   const controller = new AbortController();
 
@@ -199,6 +203,10 @@ export function openThinkingStream(
             if (data === '[DONE]') {
               onDone();
               return;
+            }
+            if (data === '[CACHED]') {
+              onCached?.();
+              continue;
             }
             if (data.startsWith('[ERROR]')) {
               onError(data.slice(7).trim());

@@ -43,6 +43,7 @@ from models import (
 )
 from preprocessor import PreprocessResult, preprocess_full
 from prompt import get_system_prompt, get_user_prompt
+from cache import cache
 
 # Load environment variables from local directory first
 backend_dir = Path(__file__).resolve().parent
@@ -542,7 +543,7 @@ def _make_degraded_message(fallback_level: int) -> str | None:
 async def _run_analysis(
     client: httpx.AsyncClient,
     git_log_raw: str,
-) -> tuple[AnalysisResult, int, AnalysisStatus, str, int, str]:
+) -> tuple[AnalysisResult, int, AnalysisStatus, str, int, str, str]:
     # 1. Preprocess (cached)
     prep = _get_or_preprocess(git_log_raw)
     log.info(
@@ -578,7 +579,7 @@ async def _run_analysis(
         ) from exc
 
     status = _classify_status(result)
-    return result, prep.commit_count, status, model_used, fallback_level, provider
+    return result, prep.commit_count, status, model_used, fallback_level, provider, raw_text
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -623,10 +624,41 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
     t0 = time.perf_counter()
 
     try:
-        result, commit_count, status, model_used, fallback_level, provider = (
+        prep = _get_or_preprocess(body.git_log)
+        cache_key = hashlib.md5(prep.formatted_log.encode(), usedforsecurity=False).hexdigest()
+        
+        # Check cache first
+        cached_entry = cache.get(cache_key)
+        if cached_entry:
+            result = AnalysisResult.model_validate(cached_entry.result_dict)
+            status = _classify_status(result)
+            return AnalyzeResponse(
+                success=True,
+                status=status,
+                result=result,
+                commits_preprocessed=prep.commit_count,
+                processing_time_ms=0,
+                model_used=cached_entry.model_used,
+                fallback_level=0,
+                degraded_mode=False,
+                provider=cached_entry.provider,
+                cached=True,
+                cache_key=cache_key
+            )
+
+        result, commit_count, status, model_used, fallback_level, provider, raw_text = (
             await _run_analysis(client, body.git_log)
         )
         processing_ms = int((time.perf_counter() - t0) * 1000)
+
+        # Store in cache
+        cache.set(
+            key=cache_key,
+            result_dict=result.model_dump(mode='json'),
+            reasoning_text=raw_text,
+            model_used=model_used,
+            provider=provider
+        )
 
         return AnalyzeResponse(
             success=True,
@@ -639,6 +671,8 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
             degraded_mode=(fallback_level > 0),
             degraded_message=_make_degraded_message(fallback_level),
             provider=provider,
+            cached=False,
+            cache_key=cache_key
         )
 
     except ValueError as exc:
@@ -677,6 +711,16 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
         try:
             try:
                 prep = _get_or_preprocess(body.git_log)
+                cache_key = hashlib.md5(prep.formatted_log.encode(), usedforsecurity=False).hexdigest()
+                
+                # Check cache first
+                cached_entry = cache.get(cache_key)
+                if cached_entry:
+                    yield "data: [CACHED]\n\n"
+                    safe = cached_entry.reasoning_text.replace("\n", "\\n")
+                    yield f"data: {safe}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
             except ValueError as exc:
                 yield f"data: [ERROR] {exc}\n\n"
                 yield "data: [DONE]\n\n"
@@ -692,6 +736,7 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
             else:
                 url = f"/models/{stream_model}:streamGenerateContent"
 
+            accumulated_text = ""
             async with client.stream(
                 "POST",
                 url,
@@ -741,8 +786,25 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
                         continue
 
                     if text:
+                        accumulated_text += text
                         safe = text.replace("\n", "\\n")
                         yield f"data: {safe}\n\n"
+                        
+            # Cache the streamed result
+            try:
+                if accumulated_text.strip():
+                    data = _extract_json_from_text(accumulated_text)
+                    result = AnalysisResult.model_validate(data)
+                    provider = PROVIDER_CHAIN[0]["provider"]
+                    cache.set(
+                        key=cache_key,
+                        result_dict=result.model_dump(mode='json'),
+                        reasoning_text=accumulated_text,
+                        model_used=stream_model,
+                        provider=provider
+                    )
+            except Exception as e:
+                log.warning("Failed to cache stream result: %s", e)
 
         except httpx.TimeoutException:
             yield f"data: [ERROR] Gemma stream timed out after {REQUEST_TIMEOUT:.0f}s\n\n"

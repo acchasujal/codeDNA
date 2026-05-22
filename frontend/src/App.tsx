@@ -76,6 +76,7 @@ export default function App() {
   const [processingMs,    setProcessingMs]    = useState<number | null>(null);
   // degraded_mode: true when the fallback model was used (primary was overloaded)
   const [degradedMode,    setDegradedMode]    = useState<{ model: string; message: string } | null>(null);
+  const [isCached,        setCached]          = useState<boolean>(false);
 
   // SSE stream control
   const [streamKey,    setStreamKey]    = useState(0);
@@ -115,6 +116,7 @@ export default function App() {
     setErrorMsg('');
     setProcessingMs(null);
     setDegradedMode(null);
+    setCached(false);
     analysisStartTimeRef.current = performance.now();
 
     // Start reasoning stream
@@ -169,6 +171,9 @@ export default function App() {
               model: resp.model_used ?? 'fallback',
               message: resp.degraded_message ?? 'Using fallback model.'
             });
+          }
+          if (resp.cached) {
+            setCached(true);
           }
           setAppState('done');
         } else {
@@ -334,6 +339,7 @@ export default function App() {
                 commitsAnalyzed={result.metadata.commits_analyzed}
                 dataQuality={result.data_quality}
                 breakdown={result.metadata.health_breakdown}
+                cached={isCached}
               />
             </div>
           )}
@@ -407,6 +413,7 @@ export default function App() {
             gitLog={streamGitLog}
             isActive={streamActive}
             onStreamComplete={handleStreamComplete}
+            onCached={() => setCached(true)}
           />
         </section>
       </main>

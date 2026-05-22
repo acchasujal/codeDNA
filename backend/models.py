@@ -422,6 +422,16 @@ class AnalyzeResponse(BaseModel):
         description="Inference provider: 'google' (AI Studio) or 'openrouter'",
     )
 
+    # ── Cache tracking ───────────────────────────────────────────────────────
+    cached: bool = Field(
+        default=False,
+        description="True when result came from cache"
+    )
+    cache_key: str = Field(
+        default="",
+        description="MD5 hash key used for cache lookup"
+    )
+
     @model_validator(mode="after")
     def validate_consistency(self) -> "AnalyzeResponse":
         if self.success and self.result is None:
