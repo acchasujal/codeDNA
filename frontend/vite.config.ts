@@ -27,8 +27,10 @@ export default defineConfig({
     // Improves cache hit rate: app changes don't re-download ~140KB of React.
     rollupOptions: {
       output: {
-        manualChunks: {
-          vendor: ['react', 'react-dom'],
+        manualChunks(id) {
+          if (id.includes('node_modules/react') || id.includes('node_modules/react-dom')) {
+            return 'vendor'
+          }
         },
       },
     },

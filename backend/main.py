@@ -42,7 +42,14 @@ from models import (
     ModelEntry,
 )
 from preprocessor import PreprocessResult, preprocess_full
-from prompt import get_system_prompt, get_user_prompt
+from prompt import (
+    get_system_prompt,
+    get_user_prompt,
+    get_json_user_prompt,
+    get_reasoning_user_prompt,
+    REASONING_SYSTEM_PROMPT,
+    JSON_SYSTEM_PROMPT,
+)
 from cache import cache
 
 # Load environment variables from local directory first
@@ -70,9 +77,10 @@ OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 # Standardize to models/gemma-4-26b-a4b-it as requested
 _PRIMARY_MODEL: str = os.getenv("GEMMA_MODEL", "models/gemma-4-26b-a4b-it")
 
-MAX_COMMITS: int       = int(os.getenv("MAX_COMMITS", "120"))
+MAX_COMMITS: int       = int(os.getenv("MAX_COMMITS", "180"))
 REQUEST_TIMEOUT: float = float(os.getenv("REQUEST_TIMEOUT", "180"))
 PORT: int              = int(os.getenv("PORT", "8000"))
+CACHE_VERSION_PREFIX: str = "v2_"
 
 # Strict per-attempt timeout of 25s for speed and fail-fast fallback
 ATTEMPT_TIMEOUT: float = float(os.getenv("ATTEMPT_TIMEOUT", "25"))
@@ -246,8 +254,11 @@ app.add_middleware(
 
 @app.exception_handler(HTTPException)
 async def _http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+    error_text = str(exc.detail)
+    if len(error_text) > 500:
+        error_text = error_text[:497] + "..."
     body = ErrorResponse(
-        error=str(exc.detail),
+        error=error_text,
         error_code="INVALID_INPUT" if exc.status_code == 400 else "API_FAILURE",
     )
     return JSONResponse(status_code=exc.status_code, content=body.model_dump())
@@ -327,14 +338,39 @@ def _extract_json_from_text(raw: str) -> dict[str, Any]:
 
     if text.startswith("```"):
         lines = text.splitlines()
-        text  = "\n".join(lines[1:-1]).strip()
+        if lines and lines[0].lstrip().startswith("```"):
+            lines = lines[1:]
+        if lines and lines[-1].strip().startswith("```"):
+            lines = lines[:-1]
+        text = "\n".join(lines).strip()
 
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start == -1 or end == 0:
         raise ValueError(f"No JSON object in model response. Preview: {raw[:200]!r}")
 
-    return json.loads(text[start:end])
+    candidate = text[start:end]
+    try:
+        return json.loads(candidate)
+    except json.JSONDecodeError:
+        repaired = _repair_json_candidate(candidate)
+        return json.loads(repaired)
+
+
+def _repair_json_candidate(candidate: str) -> str:
+    """Repair common LLM JSON mistakes without changing semantic content."""
+    text = candidate.strip()
+    text = re.sub(r"^\s*//.*$", "", text, flags=re.MULTILINE)
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(
+        r'([}\]"]|\b\d+\b|\btrue\b|\bfalse\b|\bnull\b)(\s*\n\s*)("[-A-Za-z_][^"]*"\s*:)',
+        r"\1,\2\3",
+        text,
+    )
+    text = re.sub(r",(\s*[}\]])", r"\1", text)
+    text = text.replace("\u201c", '"').replace("\u201d", '"')
+    text = text.replace("\u2018", "'").replace("\u2019", "'")
+    return text
 
 
 def _classify_status(result: AnalysisResult) -> AnalysisStatus:
@@ -538,6 +574,26 @@ def _make_degraded_message(fallback_level: int) -> str | None:
     return f"Using fallback model (level {fallback_level}). Primary model is temporarily unavailable."
 
 
+def _is_usable_reasoning_trace(reasoning_trace: str | None) -> bool:
+    if not reasoning_trace:
+        return False
+
+    trace = reasoning_trace.strip()
+    if len(trace) < 200:
+        return False
+
+    lowered = trace.lower()
+    error_markers = (
+        "[stream error]",
+        "api error",
+        "network error",
+        "unexpected error",
+        "timed out",
+        "internal server error",
+    )
+    return not any(marker in lowered for marker in error_markers)
+
+
 # ─── Core analysis pipeline ───────────────────────────────────────────────────
 
 async def _run_analysis(
@@ -616,22 +672,38 @@ async def health() -> HealthResponse:
 @app.post(
     "/analyze",
     response_model=AnalyzeResponse,
-    summary="Analyse a git log",
+    summary="Analyse a git log (Step 2: JSON structuring)",
     tags=["Analysis"],
 )
 async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
+    """
+    Map-Reduce Step 2: JSON Structuring.
+
+    If body.reasoning_trace is provided (i.e., the frontend has already run
+    the streaming Step 1), this endpoint skips re-embedding the full git log
+    and instead feeds the reasoning trace into JSON_SYSTEM_PROMPT to produce
+    the exact AnalysisResult JSON schema.
+
+    If reasoning_trace is absent, falls back to the full single-shot pipeline
+    (legacy mode / direct API calls).
+    """
     client: httpx.AsyncClient = request.app.state.client
     t0 = time.perf_counter()
 
     try:
+        # ── Always preprocess to get commit_count and cache_key ──────────
         prep = _get_or_preprocess(body.git_log)
-        cache_key = hashlib.md5(prep.formatted_log.encode(), usedforsecurity=False).hexdigest()
-        
-        # Check cache first
+        cache_key = CACHE_VERSION_PREFIX + hashlib.md5(
+            prep.formatted_log.encode(),
+            usedforsecurity=False,
+        ).hexdigest()
+
+        # Check result cache first (regardless of reasoning_trace)
         cached_entry = cache.get(cache_key)
-        if cached_entry:
+        if cached_entry and cached_entry.result_dict:  # result_dict={} means Step 1 placeholder only
             result = AnalysisResult.model_validate(cached_entry.result_dict)
             status = _classify_status(result)
+            log.info("Cache hit for key=%s…", cache_key[:8])
             return AnalyzeResponse(
                 success=True,
                 status=status,
@@ -646,25 +718,110 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
                 cache_key=cache_key
             )
 
-        result, commit_count, status, model_used, fallback_level, provider, raw_text = (
-            await _run_analysis(client, body.git_log)
+        # ── Map-Reduce Step 2: use reasoning trace if provided ────────────
+        usable_reasoning_trace = (
+            body.reasoning_trace.strip()
+            if _is_usable_reasoning_trace(body.reasoning_trace)
+            else None
         )
+        if body.reasoning_trace and not usable_reasoning_trace:
+            log.warning(
+                "Ignoring unusable reasoning trace (%d chars); falling back to full analysis",
+                len(body.reasoning_trace),
+            )
+
+        if usable_reasoning_trace:
+            log.info(
+                "Map-Reduce Step 2: structuring reasoning trace (%d chars) → JSON",
+                len(usable_reasoning_trace),
+            )
+            # Extract just the metadata header lines from the preprocessed log
+            # so the JSON model can use ground-truth counts/dates
+            header_lines = [
+                line for line in prep.formatted_log.splitlines()
+                if line.startswith("#")
+            ]
+            metadata_header = "\n".join(header_lines)
+
+            sys_prompt  = JSON_SYSTEM_PROMPT
+            user_prompt = get_json_user_prompt(
+                reasoning_trace=usable_reasoning_trace,
+                metadata_header=metadata_header,
+            )
+
+            # Use the primary (heavy) model — MODEL_CHAIN[0] — for JSON structuring
+            primary_entry = PROVIDER_CHAIN[0]
+            raw_text, model_used, fallback_level, provider = await _call_model_with_fallback(
+                client, sys_prompt, user_prompt
+            )
+
+        else:
+            # ── Legacy / single-shot fallback ─────────────────────────────
+            log.info("Legacy single-shot analysis (no reasoning_trace provided)")
+            result, commit_count, status, model_used, fallback_level, provider, raw_text = (
+                await _run_analysis(client, body.git_log)
+            )
+            processing_ms = int((time.perf_counter() - t0) * 1000)
+            cache.set(
+                key=cache_key,
+                result_dict=result.model_dump(mode='json'),
+                reasoning_text=raw_text,
+                model_used=model_used,
+                provider=provider
+            )
+            return AnalyzeResponse(
+                success=True,
+                status=status,
+                result=result,
+                commits_preprocessed=prep.commit_count,
+                processing_time_ms=processing_ms,
+                model_used=model_used,
+                fallback_level=fallback_level,
+                degraded_mode=(fallback_level > 0),
+                degraded_message=_make_degraded_message(fallback_level),
+                provider=provider,
+                cached=False,
+                cache_key=cache_key
+            )
+
+        # ── Parse + validate JSON from the Step 2 response ───────────────
+        try:
+            data = _extract_json_from_text(raw_text)
+        except (ValueError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"JSON structuring model output is not valid JSON: {exc} | "
+                f"preview: {raw_text[:300]!r}"
+            ) from exc
+
+        try:
+            result = AnalysisResult.model_validate(data)
+        except ValidationError as exc:
+            raise RuntimeError(
+                f"JSON structuring model output failed schema validation:\n{exc}"
+            ) from exc
+
+        status = _classify_status(result)
         processing_ms = int((time.perf_counter() - t0) * 1000)
 
-        # Store in cache
+        # Cache the validated result
         cache.set(
             key=cache_key,
             result_dict=result.model_dump(mode='json'),
-            reasoning_text=raw_text,
+            reasoning_text=usable_reasoning_trace or raw_text,
             model_used=model_used,
             provider=provider
+        )
+
+        log.info(
+            "Map-Reduce Step 2 complete: model=%s fallback=%d time=%dms",
+            model_used, fallback_level, processing_ms,
         )
 
         return AnalyzeResponse(
             success=True,
             status=status,
             result=result,
-            commits_preprocessed=commit_count,
+            commits_preprocessed=prep.commit_count,
             processing_time_ms=processing_ms,
             model_used=model_used,
             fallback_level=fallback_level,
@@ -704,18 +861,31 @@ async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
     tags=["Analysis"],
 )
 async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingResponse:
+    """
+    Map-Reduce Step 1: Reasoning Stream.
+
+    Uses REASONING_SYSTEM_PROMPT to instruct the model to emit a dense,
+    chronological markdown analysis — fast, streaming-friendly, NO JSON.
+    The frontend accumulates the full text and passes it to POST /analyze
+    as reasoning_trace for Step 2 JSON structuring.
+    """
     client: httpx.AsyncClient = request.app.state.client
+    # Step 1 uses the primary model (fastest available for reasoning)
     stream_model = MODEL_CHAIN[0]
 
     async def event_generator() -> AsyncIterator[str]:
         try:
             try:
                 prep = _get_or_preprocess(body.git_log)
-                cache_key = hashlib.md5(prep.formatted_log.encode(), usedforsecurity=False).hexdigest()
-                
-                # Check cache first
+                cache_key = CACHE_VERSION_PREFIX + hashlib.md5(
+                    prep.formatted_log.encode(),
+                    usedforsecurity=False,
+                ).hexdigest()
+
+                # Check cache: if we have a cached reasoning text, replay it
                 cached_entry = cache.get(cache_key)
-                if cached_entry:
+                if cached_entry and cached_entry.reasoning_text:
+                    log.info("Stream cache hit (key=%s…) — replaying cached reasoning", cache_key[:8])
                     yield "data: [CACHED]\n\n"
                     safe = cached_entry.reasoning_text.replace("\n", "\\n")
                     yield f"data: {safe}\n\n"
@@ -726,9 +896,12 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
                 yield "data: [DONE]\n\n"
                 return
 
-            sys_prompt  = get_system_prompt()
-            user_prompt = get_user_prompt(prep.formatted_log)
+            # ── Build Step 1 prompts (reasoning / markdown, NOT JSON) ──────
+            sys_prompt  = REASONING_SYSTEM_PROMPT
+            user_prompt = get_reasoning_user_prompt(prep.formatted_log)
             req_body    = _build_request_body(sys_prompt, user_prompt)
+            stream_model_used = stream_model
+            stream_provider = PROVIDER_CHAIN[0]["provider"]
 
             # Adapt URL format to support clean model_id and models/ prefix
             if stream_model.startswith("models/"):
@@ -749,8 +922,33 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
                         msg = json.loads(err).get("error", {}).get("message", err[:200])
                     except Exception:
                         msg = err[:200]
-                    yield f"data: [ERROR] API error {resp.status_code}: {msg}\n\n"
-                    yield "data: [DONE]\n\n"
+                    log.warning(
+                        "Streaming model failed with HTTP %s: %s. Falling back to non-stream inference.",
+                        resp.status_code,
+                        msg,
+                    )
+                    raw_text, stream_model_used, fallback_level, stream_provider = await _call_model_with_fallback(
+                        client, sys_prompt, user_prompt
+                    )
+                    accumulated_text = raw_text
+                    safe = raw_text.replace("\n", "\\n")
+                    yield f"data: {safe}\n\n"
+                    log.info(
+                        "Reasoning fallback succeeded [model=%s provider=%s level=%d]",
+                        stream_model_used,
+                        stream_provider,
+                        fallback_level,
+                    )
+                    try:
+                        cache.set(
+                            key=cache_key,
+                            result_dict={},
+                            reasoning_text=accumulated_text,
+                            model_used=stream_model_used,
+                            provider=stream_provider,
+                        )
+                    except Exception as e:
+                        log.warning("Failed to cache reasoning fallback: %s", e)
                     return
 
                 async for line in resp.aiter_lines():
@@ -790,21 +988,25 @@ async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingRes
                         safe = text.replace("\n", "\\n")
                         yield f"data: {safe}\n\n"
                         
-            # Cache the streamed result
+            # Step 1 complete: cache the raw reasoning text for replay.
+            # We do NOT attempt JSON parsing here — that is Step 2's job.
             try:
                 if accumulated_text.strip():
-                    data = _extract_json_from_text(accumulated_text)
-                    result = AnalysisResult.model_validate(data)
-                    provider = PROVIDER_CHAIN[0]["provider"]
+                    # Store reasoning_text so cache replay works on next identical request.
+                    # result_dict is left empty — Step 2 will populate it.
                     cache.set(
                         key=cache_key,
-                        result_dict=result.model_dump(mode='json'),
+                        result_dict={},          # placeholder; Step 2 overwrites
                         reasoning_text=accumulated_text,
-                        model_used=stream_model,
-                        provider=provider
+                        model_used=stream_model_used,
+                        provider=stream_provider
+                    )
+                    log.info(
+                        "Step 1 stream complete: %d chars cached (key=%s…)",
+                        len(accumulated_text), cache_key[:8],
                     )
             except Exception as e:
-                log.warning("Failed to cache stream result: %s", e)
+                log.warning("Failed to cache reasoning stream: %s", e)
 
         except httpx.TimeoutException:
             yield f"data: [ERROR] Gemma stream timed out after {REQUEST_TIMEOUT:.0f}s\n\n"

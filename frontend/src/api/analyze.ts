@@ -129,13 +129,26 @@ async function _handleResponse<T>(res: Response): Promise<T> {
 
 /**
  * POST /analyze
- * Sends git log text and waits for the full structured analysis (~10–30s).
+ *
+ * Map-Reduce Step 2: JSON Structuring.
+ *
+ * @param gitLog        Raw git log text (always required for preprocessing/cache-key).
+ * @param reasoningTrace Optional: the full reasoning text from Step 1 stream.
+ *                       When provided, the backend skips re-embedding the git log
+ *                       and uses the JSON_SYSTEM_PROMPT to structure the trace directly.
  */
-export async function analyzeGitLog(gitLog: string): Promise<AnalyzeResponse> {
+export async function analyzeGitLog(
+  gitLog: string,
+  reasoningTrace?: string,
+): Promise<AnalyzeResponse> {
+  const payload: Record<string, string> = { git_log: gitLog };
+  if (reasoningTrace && reasoningTrace.trim().length > 0) {
+    payload.reasoning_trace = reasoningTrace;
+  }
   const res = await fetch(`${API_BASE}/analyze`, {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
-    body:    JSON.stringify({ git_log: gitLog }),
+    body:    JSON.stringify(payload),
   });
   return _handleResponse<AnalyzeResponse>(res);
 }
@@ -161,6 +174,20 @@ export function openThinkingStream(
   onCached?: () => void,
 ): AbortController {
   const controller = new AbortController();
+  let settled = false;
+
+  const finish = () => {
+    if (settled) return;
+    settled = true;
+    onDone();
+  };
+
+  const fail = (msg: string) => {
+    if (settled) return;
+    settled = true;
+    onError(msg);
+    onDone();
+  };
 
   void (async () => {
     try {
@@ -173,8 +200,7 @@ export function openThinkingStream(
 
       if (!res.ok || !res.body) {
         const text = await res.text().catch(() => '');
-        onError(`HTTP ${res.status}: ${text.slice(0, 200)}`);
-        onDone();
+        fail(`HTTP ${res.status}: ${text.slice(0, 200)}`);
         return;
       }
 
@@ -185,7 +211,7 @@ export function openThinkingStream(
       while (true) {
         const { done, value } = await reader.read();
         if (done) {
-          onDone();
+          finish();
           break;
         }
 
@@ -201,7 +227,7 @@ export function openThinkingStream(
             const data = line.slice(5).trim();
 
             if (data === '[DONE]') {
-              onDone();
+              finish();
               return;
             }
             if (data === '[CACHED]') {
@@ -209,8 +235,7 @@ export function openThinkingStream(
               continue;
             }
             if (data.startsWith('[ERROR]')) {
-              onError(data.slice(7).trim());
-              onDone();
+              fail(data.slice(7).trim());
               return;
             }
             if (data) {
@@ -222,8 +247,7 @@ export function openThinkingStream(
       }
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') return;
-      onError(String(err));
-      onDone();
+      fail(String(err));
     }
   })();
 

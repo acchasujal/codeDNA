@@ -44,7 +44,7 @@ error — no silent hallucinations, no broken UI states.
 
 ---
 
-## Quick Start
+## Quick Start (Local Deployment)
 
 ```bash
 git clone https://github.com/acchasujal/codedna.git
@@ -53,13 +53,21 @@ git clone https://github.com/acchasujal/codedna.git
 cd codedna/backend
 pip install -r requirements.txt
 cp .env.example .env          # Add your Google AI Studio key as GEMINI_API_KEY
-uvicorn main:app --reload     # http://localhost:8000
+uvicorn main:app --reload     # API: http://localhost:8000
 
 # Frontend (new terminal)
 cd ../frontend
 npm install
-npm run dev                   # http://localhost:5173
+npm run dev                   # App: http://localhost:5173
 ```
+
+Health check:
+
+```bash
+curl http://localhost:8000/health
+```
+
+The app expects the backend on port `8000` and the frontend on port `5173` during local development.
 
 ### Get a Google AI Studio API Key
 1. Visit [aistudio.google.com](https://aistudio.google.com)
@@ -72,14 +80,65 @@ npm run dev                   # http://localhost:5173
 
 ```bash
 # Any local repo:
-git log --stat | head -3000 > history.txt
+git log --stat --date=short | head -3000 > history.txt
 # Paste contents into CodeDNA, or use the Upload .txt button.
 
 # The React 16.8 demo log (what the GIF uses):
 git clone https://github.com/facebook/react
 cd react
-git log --stat --after="2018-01-01" --before="2019-06-01" | head -3000 > react_hooks_era.txt
+git log --stat --date=short --after="2018-01-01" --before="2019-06-01" | head -3000 > react_hooks_era.txt
 ```
+
+---
+
+## Testing with Messy Commits
+
+CodeDNA is designed to be honest when commit history is weak. Short messages like `fix`, `wip`, `update`, typo-heavy messages, missing dates, and logs without file stats are flagged as lower-quality input before the model runs.
+
+Try the bundled messy sample:
+
+```bash
+cd backend
+python - <<'PY'
+from pathlib import Path
+from preprocessor import preprocess_full
+
+raw = Path("test_data/messy_commits.txt").read_text(encoding="utf-8")
+result = preprocess_full(raw)
+print(result.metadata_header)
+print()
+print(result.formatted_log[:1200])
+PY
+```
+
+Expected behavior:
+- The metadata header should show `Q:LOW` or `Q:MEDIUM` for intentionally vague logs.
+- A `QUALITY_WARNING` line should appear when messages are too vague or missing dates/file stats.
+- The final analysis should use cautious language, cite only observable hashes/files/counts, and avoid overconfident milestone claims.
+
+For better results from real repositories, prefer:
+
+```bash
+git log --stat --date=short --no-merges > history.txt
+```
+
+---
+
+## Deployment Options
+
+### Local Demo
+
+Use the Quick Start commands above. This is the safest option for judging, screen recording, and testing because it keeps setup simple and exposes backend logs clearly.
+
+### Simple Cloud Deployment
+
+Deploy the backend and frontend as separate services:
+- Backend: Render, Railway, Fly.io, or any Python host that supports FastAPI.
+- Frontend: Vercel, Netlify, Cloudflare Pages, or any static host.
+- Set `GEMINI_API_KEY`, optional `OPENROUTER_API_KEY`, `GEMMA_MODEL`, and `MAX_COMMITS` in the backend environment.
+- Point the frontend API base URL to the deployed backend if not using the local Vite proxy.
+
+Keep `CACHE_ENABLED=true` for demos so repeated analyses are fast. Use a short `CACHE_TTL_HOURS` if testing multiple prompt or preprocessing changes.
 
 ---
 
@@ -113,9 +172,13 @@ React UI
 | Variable | Required | Default | Description |
 |----------|----------|---------|-------------|
 | `GEMINI_API_KEY` | ✓ | — | Google AI Studio API key |
-| `GEMMA_MODEL` | | `gemma-2.0-flash-thinking-exp` | Model ID |
-| `MAX_COMMITS` | | `400` | Commit cap per analysis |
-| `REQUEST_TIMEOUT` | | `120` | Gemma API timeout (seconds) |
+| `GEMMA_MODEL` | | `models/gemma-4-26b-a4b-it` | Primary Google AI Studio model ID |
+| `OPENROUTER_API_KEY` | | — | Optional fallback provider key |
+| `MAX_COMMITS` | | `180` | Commit cap per analysis |
+| `REQUEST_TIMEOUT` | | `180` | Overall request timeout (seconds) |
+| `ATTEMPT_TIMEOUT` | | `25` | Per-model fallback timeout (seconds) |
+| `CACHE_ENABLED` | | `true` | Enables in-memory and disk result cache |
+| `CACHE_TTL_HOURS` | | `24` | Cache lifetime |
 | `PORT` | | `8000` | FastAPI listen port |
 
 ---

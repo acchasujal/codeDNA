@@ -24,52 +24,14 @@ import ReasoningPanel from './components/ReasoningPanel';
 import ExportButton   from './components/ExportButton';
 
 type AppState = 'idle' | 'loading' | 'done' | 'error';
+// Sub-state for the loading phase — shown in the spinner message
+type LoadingPhase = 'reasoning' | 'structuring' | null;
 
-function extractJsonFromText(raw: string): any {
-  const text = raw.trim();
-  
-  // Try direct parse first
-  try {
-    return JSON.parse(text);
-  } catch {
-    // Ignore and proceed to extraction
-  }
-
-  // Find all start and end curly braces to try every candidate JSON substring
-  const startIndices: number[] = [];
-  const endIndices: number[] = [];
-  
-  for (let i = 0; i < text.length; i++) {
-    if (text[i] === '{') startIndices.push(i);
-    if (text[i] === '}') endIndices.push(i);
-  }
-
-  // Search from the end backwards (since the valid JSON block is typically at the end of the stream)
-  for (let i = startIndices.length - 1; i >= 0; i--) {
-    const start = startIndices[i];
-    for (let j = endIndices.length - 1; j >= 0; j--) {
-      const end = endIndices[j] + 1;
-      if (end <= start) continue;
-      
-      try {
-        const candidate = text.slice(start, end);
-        const parsed = JSON.parse(candidate);
-        // Ensure it is our structured analysis report
-        if (parsed && typeof parsed === 'object' && parsed.metadata && parsed.milestones && parsed.metrics) {
-          return parsed;
-        }
-      } catch {
-        // Continue searching
-      }
-    }
-  }
-  
-  throw new Error('Could not parse a valid JSON analysis report from the stream.');
-}
 
 export default function App() {
   const [gitLog,          setGitLog]          = useState('');
   const [appState,        setAppState]        = useState<AppState>('idle');
+  const [loadingPhase,    setLoadingPhase]    = useState<LoadingPhase>(null);
   const [result,          setResult]          = useState<AnalysisResult | null>(null);
   const [errorMsg,        setErrorMsg]        = useState('');
   const [analysisStatus,  setAnalysisStatus]  = useState<AnalysisStatus | null>(null);
@@ -112,6 +74,7 @@ export default function App() {
     if (trimmed.length < 10) return;
 
     setAppState('loading');
+    setLoadingPhase('reasoning');
     setResult(null);
     setErrorMsg('');
     setProcessingMs(null);
@@ -119,7 +82,7 @@ export default function App() {
     setCached(false);
     analysisStartTimeRef.current = performance.now();
 
-    // Start reasoning stream
+    // Start reasoning stream (Step 1)
     setStreamKey((k) => k + 1);
     setStreamGitLog(trimmed);
     setStreamActive(true);
@@ -128,61 +91,48 @@ export default function App() {
   const handleStreamComplete = async (finalText: string, streamError: string | null) => {
     setStreamActive(false);
 
+    // If the stream hit an error, surface it immediately
+    if (streamError) {
+      setErrorMsg(streamError);
+      setAppState('error');
+      setLoadingPhase(null);
+      return;
+    }
+
+    // ── Map-Reduce Step 2: send reasoning trace to /analyze for JSON structuring ──
+    // The backend will use JSON_SYSTEM_PROMPT to convert the trace into the
+    // validated AnalysisResult schema — no fragile client-side JSON parsing.
     try {
-      if (streamError) {
-        throw new Error(streamError);
-      }
+      setLoadingPhase('structuring');
+      const resp = await analyzeGitLog(gitLog, finalText);
 
-      const parsed = extractJsonFromText(finalText);
-      
-      // Let's validate the parsed result structure
-      if (!parsed.metadata || !parsed.milestones || !parsed.metrics) {
-        throw new Error("Analysis failed to produce a valid report. The stream ended abruptly or failed to parse.");
-      }
+      if (resp.success && resp.result) {
+        setResult(resp.result);
+        setAnalysisStatus(resp.status);
 
-      setResult(parsed);
-      setAnalysisStatus(parsed.status ?? 'success');
-      
-      if (analysisStartTimeRef.current !== null) {
-        const totalMs = Math.round(performance.now() - analysisStartTimeRef.current);
-        setProcessingMs(totalMs);
-      }
-      
-      setAppState('done');
-    } catch (err) {
-      console.warn("Reasoning stream parse failed or encountered an error. Attempting robust non-streaming analysis fallback...", err);
-      
-      // Attempt robust non-stream fallback using the backend fallback engine
-      try {
-        setAppState('loading');
-        // Call backend /analyze directly
-        const resp = await analyzeGitLog(gitLog);
-        
-        if (resp.success && resp.result) {
-          setResult(resp.result);
-          setAnalysisStatus(resp.status);
-          if (resp.processing_time_ms) {
-            setProcessingMs(resp.processing_time_ms);
-          } else if (analysisStartTimeRef.current !== null) {
-            setProcessingMs(Math.round(performance.now() - analysisStartTimeRef.current));
-          }
-          if (resp.degraded_mode) {
-            setDegradedMode({
-              model: resp.model_used ?? 'fallback',
-              message: resp.degraded_message ?? 'Using fallback model.'
-            });
-          }
-          if (resp.cached) {
-            setCached(true);
-          }
-          setAppState('done');
-        } else {
-          throw new Error(resp.error ?? 'Unknown error from fallback analyzer.');
+        if (resp.processing_time_ms) {
+          setProcessingMs(resp.processing_time_ms);
+        } else if (analysisStartTimeRef.current !== null) {
+          setProcessingMs(Math.round(performance.now() - analysisStartTimeRef.current));
         }
-      } catch (fallbackErr) {
-        setErrorMsg(fallbackErr instanceof Error ? fallbackErr.message : 'Failed to analyze git log.');
-        setAppState('error');
+
+        if (resp.degraded_mode) {
+          setDegradedMode({
+            model:   resp.model_used   ?? 'fallback',
+            message: resp.degraded_message ?? 'Using fallback model.',
+          });
+        }
+        if (resp.cached) setCached(true);
+
+        setAppState('done');
+      } else {
+        throw new Error(resp.error ?? 'Unknown error from JSON structuring step.');
       }
+    } catch (err) {
+      setErrorMsg(err instanceof Error ? err.message : 'Failed to structure analysis result.');
+      setAppState('error');
+    } finally {
+      setLoadingPhase(null);
     }
   };
 
@@ -349,9 +299,15 @@ export default function App() {
             <div className="flex-1 flex flex-col items-center justify-center gap-5 animate-fade-in">
               <div className="w-12 h-12 rounded-full border-t-2 border-emerald-500 border-r-2 border-transparent animate-spin" />
               <div className="text-center font-mono">
-                <p className="text-xs text-zinc-400 mb-3">
-                  Gemma 4 is analyzing your codebase...
-                </p>
+                {loadingPhase === 'structuring' ? (
+                  <p className="text-xs text-emerald-400/80 mb-3">
+                    Reasoning complete — structuring JSON report...
+                  </p>
+                ) : (
+                  <p className="text-xs text-zinc-400 mb-3">
+                    Gemma 4 is reasoning through your codebase...
+                  </p>
+                )}
                 {/* CSS progress bar — no JS interval needed */}
                 <div className="w-48 h-0.5 bg-zinc-900 rounded-full mx-auto overflow-hidden">
                 <div className="h-full bg-gradient-to-r from-emerald-500 to-teal-500
@@ -359,7 +315,9 @@ export default function App() {
                 />
                 </div>
                 <p className="text-[10px] text-zinc-600 mt-2">
-                  Reasoning stream active in right panel
+                  {loadingPhase === 'structuring'
+                    ? 'Building timeline from reasoning trace'
+                    : 'Reasoning stream active in right panel'}
                 </p>
               </div>
             </div>

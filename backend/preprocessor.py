@@ -7,7 +7,7 @@ Pipeline:
             →  format_for_llm() →  PreprocessResult
 
 Aggressive performance mode features:
-  - MAX_COMMITS = 120 hard limit.
+  - MAX_COMMITS = 180 hard limit.
   - Slices oldest commits immediately if over limit to avoid memory/token bloat.
   - Aggressive compression: drops merges and collapses vague runs of >=2 commits when overloaded.
   - Compacted metadata header with basename-only hotspots and 6-month histogram cap.
@@ -26,11 +26,12 @@ log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Aggressive hard limit of 120 commits for maximum speed and API reliability
-MAX_COMMITS: int     = int(os.getenv("MAX_COMMITS", "120"))
+# Aggressive hard limit of 180 commits for balanced detail and API reliability
+MAX_COMMITS: int     = int(os.getenv("MAX_COMMITS", "180"))
 TINY_REPO_THRESHOLD  = 50    # commits — triggers micro-analysis label
-LOW_QUALITY_RATIO    = 0.60  # if ≥60 % of messages are vague → quality=low
-MED_QUALITY_RATIO    = 0.30  # if ≥30 % vague → quality=medium
+LOW_QUALITY_RATIO    = 0.55  # if many messages are vague/noisy -> quality=low
+MED_QUALITY_RATIO    = 0.25  # if some messages are vague/noisy -> quality=medium
+SHORT_MESSAGE_CHARS  = 12
 
 # Approximate chars-per-token for Gemma tokenizer
 _CHARS_PER_TOKEN     = 3.8
@@ -67,12 +68,34 @@ _VAGUE_PATTERNS: re.Pattern[str] = re.compile(
     r"|lint"
     r"|fmt"
     r"|format"
+    r"|work"
     r"|merge"
     r"|revert"
     r"|revision"
+    r"|oops"
+    r"|again"
+    r"|more"
+    r"|final"
+    r"|final2"
+    r"|asdf"
+    r"|todo"
+    r"|try"
+    r"|trying"
+    r"|debug"
+    r"|save"
+    r"|checkpoint"
+    r"|commit"
     r"|."          # single char
     r"|[0-9]+"     # pure numbers
     r")\s*\.?$",
+    re.IGNORECASE,
+)
+
+_MESSY_WORD_PATTERN: re.Pattern[str] = re.compile(
+    r"\b("
+    r"wip|tmp|temp|misc|stuff|changes?|updates?|fix(es|ed)?|bug|oops|again|todo"
+    r"|updte|udpate|updat|chnage|chagnes|fi[xs]|fxi|fux|wrok|teh|adn"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -92,6 +115,14 @@ _ONELINE_RE: re.Pattern[str] = re.compile(
     r"^([0-9a-f]{5,40})"          # group 1: hash
     r"(?:\s+\(.*?\))?"            # optional: ref decorations
     r"\s+(.*?)$",                  # group 2: remainder
+    re.IGNORECASE,
+)
+
+_LOOSE_HASH_RE: re.Pattern[str] = re.compile(
+    r"^\s*(?:[-*]\s*)?(?:\d+[.)]\s*)?"
+    r"([0-9a-f]{5,40})\b"
+    r"(?:\s+|[:|-]+\s*)"
+    r"(.+?)\s*$",
     re.IGNORECASE,
 )
 
@@ -140,6 +171,11 @@ class QualityScore:
     total_count:   int   = 0
     vague_ratio:   float = 0.0
     bug_fix_count: int   = 0
+    short_count:   int   = 0
+    short_ratio:   float = 0.0
+    missing_dates: int   = 0
+    missing_files: int   = 0
+    warning:       str   = ""
 
     @property
     def bug_fix_ratio_pct(self) -> str:
@@ -167,12 +203,28 @@ class PreprocessResult:
 
 def _is_vague(message: str) -> bool:
     """Return True if the commit message carries no analytical signal."""
-    msg = message.strip()
+    msg = _normalize_message(message)
     if len(msg) < 4:
         return True
-    if msg.endswith("..."):
-        return False
-    return bool(_VAGUE_PATTERNS.match(msg))
+    if _VAGUE_PATTERNS.match(msg):
+        return True
+    words = re.findall(r"[a-zA-Z]+", msg)
+    return len(words) <= 2 and bool(_MESSY_WORD_PATTERN.search(msg))
+
+
+def _normalize_message(message: str) -> str:
+    """Normalize noisy commit-message wrappers without inventing signal."""
+    msg = message.strip()
+    msg = re.sub(r"^\[[^\]]+\]\s*", "", msg)
+    msg = re.sub(
+        r"^(feat|fix|docs|style|refactor|test|chore|build|ci)(\([^)]+\))?:\s*",
+        r"\1: ",
+        msg,
+        flags=re.IGNORECASE,
+    )
+    msg = re.sub(r"\s+", " ", msg)
+    msg = msg.strip(" -:\t")
+    return msg or "empty message"
 
 
 _MONTH_MAP: dict[str, str] = {
@@ -272,7 +324,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
             if commit_match:
                 if current_commit:
                     if message_lines:
-                        current_commit.message = message_lines[0]
+                        current_commit.message = _normalize_message(message_lines[0])
                     current_commit.is_merge   = bool(_MERGE_PATTERN.match(current_commit.message))
                     current_commit.is_vague   = _is_vague(current_commit.message)
                     current_commit.is_bug_fix = bool(_BUG_FIX_PATTERN.search(current_commit.message))
@@ -323,7 +375,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
 
         if current_commit:
             if message_lines:
-                current_commit.message = message_lines[0]
+                current_commit.message = _normalize_message(message_lines[0])
             current_commit.is_merge   = bool(_MERGE_PATTERN.match(current_commit.message))
             current_commit.is_vague   = _is_vague(current_commit.message)
             current_commit.is_bug_fix = bool(_BUG_FIX_PATTERN.search(current_commit.message))
@@ -345,7 +397,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
                 i += 1
                 continue
 
-            m = _ONELINE_RE.match(stripped)
+            m = _ONELINE_RE.match(stripped) or _LOOSE_HASH_RE.match(stripped)
             if not m:
                 i += 1
                 continue
@@ -359,7 +411,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
             else:
                 message = remainder
 
-            message = re.sub(r"^\(.*?\)\s*", "", message).strip()
+            message = _normalize_message(re.sub(r"^\(.*?\)\s*", "", message))
             ins, dels, files, fnames = _extract_stat_churn(lines, i + 1)
 
             commits.append(ParsedCommit(
@@ -397,14 +449,42 @@ def score_quality(commits: list[ParsedCommit]) -> QualityScore:
         return QualityScore(level="low", total_count=0)
 
     vague_count   = sum(1 for c in non_merge if c.is_vague)
+    short_count   = sum(1 for c in non_merge if len(c.message.strip()) <= SHORT_MESSAGE_CHARS)
+    missing_dates = sum(1 for c in non_merge if not c.date)
+    missing_files = sum(1 for c in non_merge if c.files_changed == 0 and not c.files)
     bug_fix_count = sum(1 for c in non_merge if c.is_bug_fix)
     vague_ratio   = vague_count / total
+    short_ratio   = short_count / total
+    missing_date_ratio = missing_dates / total
+    missing_file_ratio = missing_files / total
 
     level = (
-        "low"    if vague_ratio >= LOW_QUALITY_RATIO else
-        "medium" if vague_ratio >= MED_QUALITY_RATIO else
+        "low"    if (
+            vague_ratio >= LOW_QUALITY_RATIO
+            or (vague_ratio >= 0.40 and short_ratio >= 0.45)
+            or (missing_date_ratio >= 0.80 and missing_file_ratio >= 0.80)
+        ) else
+        "medium" if (
+            vague_ratio >= MED_QUALITY_RATIO
+            or short_ratio >= 0.35
+            or missing_date_ratio >= 0.60
+            or missing_file_ratio >= 0.70
+        ) else
         "high"
     )
+
+    warning = ""
+    if level == "low":
+        warning = (
+            "LOW_INPUT_QUALITY: many commit messages are vague, very short, "
+            "or missing dates/file stats. Use conservative low-confidence "
+            "milestones and cite only observable hashes, counts, dates, and files."
+        )
+    elif level == "medium":
+        warning = (
+            "MEDIUM_INPUT_QUALITY: some commit messages are vague or lack dates/file stats. "
+            "Avoid strong claims without direct evidence."
+        )
 
     return QualityScore(
         level         = level,
@@ -412,6 +492,11 @@ def score_quality(commits: list[ParsedCommit]) -> QualityScore:
         total_count   = total,
         vague_ratio   = vague_ratio,
         bug_fix_count = bug_fix_count,
+        short_count   = short_count,
+        short_ratio   = short_ratio,
+        missing_dates = missing_dates,
+        missing_files = missing_files,
+        warning       = warning,
     )
 
 
@@ -568,12 +653,20 @@ def _build_metadata_header(
     earliest, latest = date_range if date_range else ("?", "?")
     
     # Line 1: Basic stats combined into one line
-    hdr = f"# META: {total_parsed}tot | {commit_count}ana | Q:{quality.level.upper()} | Fx:{quality.bug_fix_ratio_pct} | Vg:{round(quality.vague_ratio * 100)}% | Dates:{earliest}..{latest}"
+    hdr = (
+        f"# META: {total_parsed}tot | {commit_count}ana | Q:{quality.level.upper()} "
+        f"| Fx:{quality.bug_fix_ratio_pct} | Vg:{round(quality.vague_ratio * 100)}% "
+        f"| Short:{round(quality.short_ratio * 100)}% | NoDate:{quality.missing_dates} "
+        f"| NoFiles:{quality.missing_files} | Dates:{earliest}..{latest}"
+    )
     if is_tiny:
         hdr += " | TINY"
     if total_parsed > commit_count:
         hdr += f" | TRUNC:{commit_count}"
     lines.append(hdr)
+
+    if quality.warning:
+        lines.append(f"# QUALITY_WARNING: {quality.warning}")
 
     # Line 2: Condensed chronological monthly counts (last 6 months only to save tokens)
     if monthly_histogram:

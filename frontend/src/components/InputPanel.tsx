@@ -17,9 +17,20 @@
  * Strict: No <form> tags. All triggers use onClick handlers.
  */
 
-import { useMemo, useRef } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import React from 'react';
 
+const ChevronDown = ({ className }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <polyline points="6 9 12 15 18 9"></polyline>
+  </svg>
+);
+
+const ChevronUp = ({ className }: { className?: string }) => (
+  <svg xmlns="http://www.w3.org/2000/svg" width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" className={className}>
+    <polyline points="18 15 12 9 6 15"></polyline>
+  </svg>
+);
 interface InputPanelProps {
   value:      string;
   onChange:   (v: string) => void;
@@ -890,6 +901,7 @@ Date:   Thu Jun 20 14:30:00 2019 -0700
 
 export default function InputPanel({ value, onChange, onAnalyze, isLoading }: InputPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const [isExpanded, setIsExpanded] = useState(false);
 
   const handleLoadDemo = () => {
     onChange(REACT_DEMO_LOG.trim());
@@ -911,6 +923,10 @@ export default function InputPanel({ value, onChange, onAnalyze, isLoading }: In
     () => (value ? value.split('\n').filter((l) => l.trim().length > 0).length : 0),
     [value],
   );
+
+  const rawLines = useMemo(() => (value ? value.split('\n') : []), [value]);
+  const isLong = rawLines.length > 10;
+  const showTruncated = isLong && value.length > 0 && !isExpanded;
 
   const isInputValid = value.trim().length >= 10;
 
@@ -954,20 +970,31 @@ export default function InputPanel({ value, onChange, onAnalyze, isLoading }: In
       </div>
 
       {/* Textarea */}
-      <div className="flex-1 min-h-0 relative">
-        <textarea
-          id="git-log-input"
-          className="w-full h-full bg-zinc-950/80 border border-zinc-900 rounded-xl p-4
-                     text-xs font-mono text-zinc-300 placeholder-zinc-700
-                     focus:outline-none focus:border-emerald-800/60 focus:ring-1 focus:ring-emerald-800/40
-                     resize-none transition-colors duration-200 shadow-[inset_0_2px_8px_rgba(0,0,0,0.8)]
-                     hover:border-zinc-800 scrollbar-thin"
-          placeholder={`# Paste your git log here, e.g.:\ncommit a3e8d24...\nAuthor: Jane Dev <jane@example.com>\nDate:   Wed Mar 11 16:32:00 2024 -0400\n\n    fix: Resolve memory leak in hooks callback\n\n src/hooks/useEffect.js | 12 +++---`}
-          value={value}
-          onChange={(e) => onChange(e.target.value)}
-          spellCheck={false}
-          aria-label="Git log content input"
-        />
+      <div className="flex-1 min-h-0 relative flex flex-col">
+        {showTruncated ? (
+          <div className="w-full h-full bg-zinc-950/80 border border-zinc-900 rounded-xl p-4
+                     text-xs font-mono text-zinc-300 overflow-hidden shadow-[inset_0_2px_8px_rgba(0,0,0,0.8)]">
+            <div className="text-zinc-500 mb-2 select-none">{'// Git log snippet:'}</div>
+            {rawLines.slice(0, 8).map((line, i) => (
+              <div key={i} className="truncate">{line || ' '}</div>
+            ))}
+            <div className="text-emerald-500/70 italic mt-2">... ({rawLines.length - 8} more lines)</div>
+          </div>
+        ) : (
+          <textarea
+            id="git-log-input"
+            className="w-full h-full bg-zinc-950/80 border border-zinc-900 rounded-xl p-4
+                       text-xs font-mono text-zinc-300 placeholder-zinc-700
+                       focus:outline-none focus:border-emerald-800/60 focus:ring-1 focus:ring-emerald-800/40
+                       resize-none transition-colors duration-200 shadow-[inset_0_2px_8px_rgba(0,0,0,0.8)]
+                       hover:border-zinc-800 scrollbar-thin"
+            placeholder={`# Paste your git log here, e.g.:\ncommit a3e8d24...\nAuthor: Jane Dev <jane@example.com>\nDate:   Wed Mar 11 16:32:00 2024 -0400\n\n    fix: Resolve memory leak in hooks callback\n\n src/hooks/useEffect.js | 12 +++---`}
+            value={value}
+            onChange={(e) => onChange(e.target.value)}
+            spellCheck={false}
+            aria-label="Git log content input"
+          />
+        )}
 
         {/* Demo overlay — only shown when textarea is empty */}
         {value.length === 0 && (
@@ -993,6 +1020,28 @@ export default function InputPanel({ value, onChange, onAnalyze, isLoading }: In
             </span>
           </div>
         )}
+
+        {/* Expand / Collapse Button */}
+        {isLong && value.length > 0 && (
+          <div className="absolute bottom-4 right-4 z-10">
+            <button
+              onClick={() => setIsExpanded(!isExpanded)}
+              className="flex items-center gap-1.5 px-3 py-1.5 bg-zinc-900 hover:bg-zinc-800 border border-zinc-700 text-zinc-300 text-[10px] font-mono rounded-lg shadow-lg transition-colors cursor-pointer"
+            >
+              {isExpanded ? (
+                <>
+                  <ChevronUp className="w-3.5 h-3.5" />
+                  Hide
+                </>
+              ) : (
+                <>
+                  <ChevronDown className="w-3.5 h-3.5" />
+                  See Full Git Log
+                </>
+              )}
+            </button>
+          </div>
+        )}
       </div>
 
       {/* Footer bar */}
@@ -1009,7 +1058,7 @@ export default function InputPanel({ value, onChange, onAnalyze, isLoading }: In
         <div className="flex gap-2">
           {value.trim().length > 0 && (
             <button
-              onClick={() => onChange('')}
+              onClick={() => { onChange(''); setIsExpanded(false); }}
               className="px-3 py-2 border border-zinc-900 bg-zinc-950 text-zinc-500
                          hover:text-zinc-300 font-mono text-xs rounded-lg cursor-pointer
                          transition-colors"

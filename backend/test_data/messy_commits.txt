@@ -1,0 +1,53 @@
+9f2a1c3 2026-05-21 fix
+ src/App.tsx | 12 ++++++------
+ 1 file changed, 6 insertions(+), 6 deletions(-)
+
+8e7d6c5 update
+
+7a6b5c4 2026-05-19 wip
+ backend/main.py | 34 +++++++++++++++++++++++++---------
+ 1 file changed, 25 insertions(+), 9 deletions(-)
+
+6b5c4d3 2026-05-18 fxi login thing
+ frontend/src/api/analyze.ts | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+5c4d3e2 2026-05-17 more changes
+
+4d3e2f1 2026-05-16 add cache prefix for analysis results
+ backend/main.py | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+3e2f1a0 updte readme
+ README.md | 18 ++++++++++++++++++
+ 1 file changed, 18 insertions(+)
+
+2f1a0b9 2026-05-15 temp
+ backend/preprocessor.py | 42 +++++++++++++++++++++++++++++-------------
+ 1 file changed, 29 insertions(+), 13 deletions(-)
+
+1a0b9c8 2026-05-14 handle malformed json from fallback model
+ backend/main.py | 28 ++++++++++++++++++++--------
+ 1 file changed, 20 insertions(+), 8 deletions(-)
+
+0b9c8d7 2026-05-13 misc
+
+abc1234 2026-05-12 improve reasoning prompt output
+ backend/prompt.py | 64 +++++++++++++++++++++++++++++++++++++++++--------------
+ 1 file changed, 48 insertions(+), 16 deletions(-)
+
+def5678 2026-05-11 fix fix
+ frontend/src/components/ReasoningPanel.tsx | 10 ++++++----
+ 1 file changed, 6 insertions(+), 4 deletions(-)
+
+123abcd 2026-05-10 checkpoint
+
+987fedc 2026-05-09 parse git stat lines in preprocessor
+ backend/preprocessor.py | 53 +++++++++++++++++++++++++++++++++++++------------
+ 1 file changed, 41 insertions(+), 12 deletions(-)
+
+876dcba 2026-05-08 final2
+
+765cba9 2026-05-07 correct stream completion state
+ frontend/src/api/analyze.ts | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)

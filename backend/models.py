@@ -134,12 +134,12 @@ class Milestone(BaseModel):
     v2: adds confidence, commit_count, and dominant_files.
     """
 
-    id: str = Field(..., min_length=1, max_length=80)
-    period: PeriodString = Field(..., description="'YYYY-MM' or 'YYYY-MM to YYYY-MM'")
-    type: MilestoneType = Field(...)
-    title: str = Field(..., min_length=1, max_length=80)
-    description: str = Field(..., min_length=10, max_length=800)
-    severity: SeverityLevel = Field(...)
+    id: str = Field(default="unknown-id", min_length=1, max_length=80)
+    period: PeriodString = Field(default="Unknown Period", description="'YYYY-MM' or 'YYYY-MM to YYYY-MM'")
+    type: MilestoneType = Field(default=MilestoneType.STABILITY)
+    title: str = Field(default="Untitled Milestone", min_length=1, max_length=80)
+    description: str = Field(default="No description provided.", min_length=10, max_length=800)
+    severity: SeverityLevel = Field(default=SeverityLevel.MEDIUM)
     commit_hashes: list[str] = Field(default_factory=list, max_length=10)
 
     # v2 additions — all optional with safe defaults
@@ -350,6 +350,10 @@ class AnalyzeRequest(BaseModel):
         ...,
         min_length=10,
         description="Raw git log text pasted by the user (any supported format)",
+    )
+    reasoning_trace: Optional[str] = Field(
+        default=None,
+        description="Optional pre-computed reasoning trace to speed up analysis",
     )
 
     @field_validator("git_log", mode="before")
