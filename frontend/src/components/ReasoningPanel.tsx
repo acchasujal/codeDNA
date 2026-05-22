@@ -1,179 +1,153 @@
 /**
- * ReasoningPanel.tsx — SSE Streaming Dev Console for Gemma 4 Thinking Tokens.
- * Connects directly to GET /analyze/stream, pulling real-time logical reasoning traces.
- * Employs custom buffers to isolate render cascades, preventing layout thrashing under heavy streams.
+ * ReasoningPanel.tsx — SSE Streaming console for Gemma 4 Thinking tokens.
+ *
+ * v2 changes:
+ *   - Uses fetch + ReadableStream POST via openThinkingStream() AbortController API
+ *     (replaces EventSource which only supports GET).
+ *   - Removed fake terminal theater strings ([SYS_LOG], [FATAL SYSTEM EXCEPTION]).
+ *   - Removed the duration timer (adds complexity, low trust value).
+ *   - Clean, professional error display.
+ *   - controllerRef for clean stream cancellation on unmount/re-trigger.
  */
 
 import { useEffect, useRef, useState } from 'react';
 import { openThinkingStream } from '../api/analyze';
 
 interface ReasoningPanelProps {
-  gitLog: string;         // Re-initiates stream when this changes
-  isActive: boolean;      // Orchestrated by App state
-  onStreamComplete: () => void;
+  gitLog:           string;
+  isActive:         boolean;
+  onStreamComplete: (finalText: string, errorMsg: string | null) => void;
 }
 
-export default function ReasoningPanel({ gitLog, isActive, onStreamComplete }: ReasoningPanelProps) {
-  const [tokens, setTokens] = useState<string>('');
-  const [isDone, setIsDone] = useState(false);
+export default function ReasoningPanel({
+  gitLog,
+  isActive,
+  onStreamComplete,
+}: ReasoningPanelProps) {
+  const [tokens, setTokens]           = useState<string>('');
+  const [isDone, setIsDone]           = useState(false);
   const [isConnecting, setIsConnecting] = useState(false);
-  const [tokenCount, setTokenCount] = useState(0);
-  const [duration, setDuration] = useState(0);
+  const [tokenCount, setTokenCount]   = useState(0);
 
-  const bottomRef = useRef<HTMLDivElement>(null);
-  const sourceRef = useRef<EventSource | null>(null);
-  const timerRef = useRef<number | null>(null);
+  const bottomRef     = useRef<HTMLDivElement>(null);
+  const controllerRef = useRef<AbortController | null>(null);
+  const accumulatedTokensRef = useRef<string>('');
 
   useEffect(() => {
     if (!isActive || !gitLog) return;
 
-    // Reset states and clear prior logs
-    sourceRef.current?.close();
-    if (timerRef.current) {
-      window.clearInterval(timerRef.current);
-    }
-    
+    // Cancel any in-flight stream before starting a new one
+    controllerRef.current?.abort();
+
     setTokens('');
     setIsDone(false);
     setIsConnecting(true);
     setTokenCount(0);
-    setDuration(0);
+    accumulatedTokensRef.current = '';
 
-    const startTime = Date.now();
-    timerRef.current = window.setInterval(() => {
-      setDuration(Math.floor((Date.now() - startTime) / 1000));
-    }, 1000);
-
-    const source = openThinkingStream(gitLog);
-    sourceRef.current = source;
-
-    source.onopen = () => {
-      setIsConnecting(false);
-    };
-
-    source.onmessage = (ev) => {
-      const data: string = ev.data;
-
-      // Handle stream completion sentinel
-      if (data === '[DONE]') {
+    const controller = openThinkingStream(
+      gitLog,
+      // onToken
+      (text) => {
+        setIsConnecting(false);
+        accumulatedTokensRef.current += text;
+        setTokens(accumulatedTokensRef.current);
+        setTokenCount((c) => c + 1);
+      },
+      // onDone
+      () => {
         setIsDone(true);
         setIsConnecting(false);
-        source.close();
-        onStreamComplete();
-        if (timerRef.current) {
-          window.clearInterval(timerRef.current);
-        }
-        return;
-      }
-
-      // Handle raw error messages forwarded by main.py
-      if (data.startsWith('[ERROR]')) {
-        setTokens((prev) => prev + `\n\n[FATAL SYSTEM EXCEPTION] ${data}\n`);
+        onStreamComplete(accumulatedTokensRef.current, null);
+      },
+      // onError
+      (msg) => {
+        accumulatedTokensRef.current += `\n\n[Stream error] ${msg}\n`;
+        setTokens(accumulatedTokensRef.current);
         setIsConnecting(false);
-        source.close();
-        onStreamComplete();
-        if (timerRef.current) {
-          window.clearInterval(timerRef.current);
-        }
-        return;
-      }
+        onStreamComplete(accumulatedTokensRef.current, msg);
+      },
+    );
 
-      // De-serialize raw JSON/escaped newlines to render formatting perfectly
-      const cleanToken = data.replace(/\\n/g, '\n');
-      setTokens((prev) => prev + cleanToken);
-      setTokenCount((count) => count + 1);
-    };
-
-    source.onerror = () => {
-      setTokens((prev) => prev + '\n\n[SYSTEM ALARM] Event stream connection severed. Halting process.\n');
-      setIsConnecting(false);
-      source.close();
-      onStreamComplete();
-      if (timerRef.current) {
-        window.clearInterval(timerRef.current);
-      }
-    };
+    controllerRef.current = controller;
 
     return () => {
-      source.close();
-      if (timerRef.current) {
-        window.clearInterval(timerRef.current);
-      }
+      controller.abort();
     };
   }, [gitLog, isActive]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // Cinematic autoscrolling
+  // Auto-scroll to bottom as tokens arrive
   useEffect(() => {
     if (bottomRef.current) {
       bottomRef.current.scrollIntoView({ behavior: 'smooth' });
     }
-  }, [tokens, isConnecting]);
+  }, [tokens]);
 
   const isEmpty = tokens.length === 0;
 
   return (
-    <div className="flex flex-col h-full select-none">
-      
-      {/* Console title block */}
+    <div className="flex flex-col h-full">
+      {/* Panel header */}
       <div className="flex items-center justify-between mb-3 shrink-0">
         <div className="flex items-center gap-2">
-          <div className={`w-2 h-2 rounded-full ${
-            isActive && !isDone 
-              ? 'bg-emerald-400 animate-pulse shadow-[0_0_8px_rgba(52,211,153,0.7)]' 
-              : isDone 
-                ? 'bg-zinc-600' 
-                : 'bg-zinc-700'
-          }`} />
+          <div
+            className={`w-2 h-2 rounded-full transition-colors duration-300 ${
+              isActive && !isDone
+                ? 'bg-emerald-400 animate-pulse shadow-[0_0_6px_rgba(52,211,153,0.6)]'
+                : isDone
+                  ? 'bg-zinc-500'
+                  : 'bg-zinc-700'
+            }`}
+          />
           <span className="text-xs font-mono font-bold text-zinc-400 uppercase tracking-widest">
             Reasoning Stream
           </span>
         </div>
 
-        {/* Dynamic streaming metrics display */}
-        {isActive && (
-          <div className="font-mono text-[10px] text-zinc-500 flex gap-3">
-            <span>tokens: <span className="text-emerald-500/80">{tokenCount}</span></span>
-            <span>time: <span className="text-zinc-400">{duration}s</span></span>
-          </div>
-        )}
-
-        {isDone && (
-          <span className="text-[10px] font-mono text-emerald-400 font-semibold uppercase tracking-wider animate-fade-in">
-            Stream syncd ✓
-          </span>
-        )}
+        <div className="font-mono text-[10px] text-zinc-500 flex gap-3">
+          {isActive && !isDone && (
+            <span>
+              tokens:{' '}
+              <span className="text-emerald-500">{tokenCount}</span>
+            </span>
+          )}
+          {isDone && (
+            <span className="text-emerald-400 font-semibold uppercase tracking-wider animate-fade-in">
+              Complete ✓
+            </span>
+          )}
+        </div>
       </div>
 
-      {/* Retro developer CRT console body */}
+      {/* Terminal body */}
       <div
-        className="flex-1 overflow-y-auto bg-black border border-zinc-900 rounded-xl p-4
-                   font-mono text-[11px] leading-relaxed select-text scrollbar-thin relative"
+        className="flex-1 overflow-y-auto overflow-x-hidden bg-zinc-950 border border-zinc-900 rounded-xl p-4
+                   font-mono text-[11px] leading-relaxed scrollbar-thin"
         aria-live="polite"
-        aria-label="Thinking pipeline traces"
+        aria-label="Gemma 4 reasoning trace"
       >
-        {/* Subtle CRT raster scans mask for pure hackathon flavor */}
-        <div className="absolute inset-0 bg-radial-gradient from-transparent to-black pointer-events-none opacity-40 z-20" />
-
+        {/* Idle placeholder */}
         {isEmpty && !isActive && (
-          <div className="text-zinc-700 space-y-2 select-none z-10 relative">
-            <p className="text-zinc-800">// GEMMA 4 THINKING PROCESS LOGS</p>
-            <p className="text-zinc-800">// SYSTEM ARTIFACT ID: CONSOLE_CORE_STREAM</p>
-            <p className="text-zinc-800">// Awaiting git log sequence ingestion...</p>
-            <p className="text-zinc-800 animate-blink-cursor">▌</p>
+          <div className="text-zinc-700 space-y-1 select-none">
+            <p>{'// Gemma 4 thinking trace'}</p>
+            <p>{'// Will appear here during analysis'}</p>
+            <p className="animate-blink-cursor">▌</p>
           </div>
         )}
 
+        {/* Connecting indicator */}
         {isConnecting && (
-          <div className="text-emerald-500/60 animate-pulse font-bold tracking-wide select-none z-10 relative">
-            [SYS_LOG] Connecting socket stream to Google AI Studio...
+          <div className="text-zinc-500 font-mono">
+            Connecting to Gemma 4...
+            <span className="animate-blink-cursor ml-1">▌</span>
           </div>
         )}
 
-        {/* Real-time tokens block */}
-        <div className="text-emerald-400/90 whitespace-pre-wrap font-mono break-all z-10 relative">
+        {/* Live token stream */}
+        <div className="text-emerald-400 whitespace-pre-wrap break-words select-text">
           {tokens}
           {isActive && !isDone && tokens.length > 0 && (
-            <span className="text-emerald-400 font-bold select-none animate-blink-cursor">▌</span>
+            <span className="text-emerald-400 animate-blink-cursor">▌</span>
           )}
         </div>
 

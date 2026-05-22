@@ -1,39 +1,33 @@
 """
 main.py — CodeDNA FastAPI application.
 
-Architecture:
-  - One httpx.AsyncClient per app lifetime (connection-pooled, timeout-aware).
-  - POST /analyze   — single Gemma inference call, returns structured JSON.
-  - GET  /health    — liveness + config echo.
-  - GET  /analyze/stream — real SSE token stream via the streamGenerateContent
-                           endpoint; no fake streaming, no polling loops.
+Provides resilient high-performance API services leveraging Gemma 4 MoE.
+Features connection-pooled HTTP clients, SSE response token streaming,
+multi-model fallback chain, and preprocessing LRU cache.
 
-Google AI Studio API:
-  Non-streaming: POST .../models/{model}:generateContent?key={key}
-  Streaming:     POST .../models/{model}:streamGenerateContent?key={key}&alt=sse
-
-Constraints enforced here:
-  - ONE Gemma call per /analyze request (no chains, no multi-agent).
-  - All network I/O is async (httpx.AsyncClient, never requests/urllib).
-  - Blocking code never runs on the event loop.
-  - Hard timeout on every API call (REQUEST_TIMEOUT env var).
-  - Input validated by Pydantic before any network I/O starts.
-  - All errors map to structured ErrorResponse — no raw tracebacks to clients.
+Required Updates:
+  - Primary model = "models/gemma-4-26b-a4b-it"
+  - Per-attempt timeout = 22 seconds
+  - URL format adaptation for "models/" prefixes.
 """
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import json
 import logging
 import os
 import re
 import time
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator
 
 import httpx
+from pathlib import Path
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
@@ -45,11 +39,14 @@ from models import (
     AnalyzeResponse,
     ErrorResponse,
     HealthResponse,
+    ModelEntry,
 )
-from preprocessor import preprocess_full
+from preprocessor import PreprocessResult, preprocess_full
 from prompt import get_system_prompt, get_user_prompt
 
-load_dotenv()
+# Load environment variables from local directory first
+backend_dir = Path(__file__).resolve().parent
+load_dotenv(dotenv_path=backend_dir / ".env")
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -62,18 +59,23 @@ log = logging.getLogger("codedna")
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-# Support both GEMINI_API_KEY (legacy) and GEMMA_API_KEY (spec)
 API_KEY: str = (
     os.getenv("GEMMA_API_KEY")
     or os.getenv("GEMINI_API_KEY")
     or ""
 )
-GEMMA_MODEL: str    = os.getenv("GEMMA_MODEL", "gemma-2.0-flash-thinking-exp")
-MAX_COMMITS: int    = int(os.getenv("MAX_COMMITS", "400"))
-REQUEST_TIMEOUT: float = float(os.getenv("REQUEST_TIMEOUT", "120"))
-PORT: int           = int(os.getenv("PORT", "8000"))
+OPENROUTER_API_KEY: str = os.getenv("OPENROUTER_API_KEY", "")
 
-# Google AI Studio REST base
+# Standardize to models/gemma-4-26b-a4b-it as requested
+_PRIMARY_MODEL: str = os.getenv("GEMMA_MODEL", "models/gemma-4-26b-a4b-it")
+
+MAX_COMMITS: int       = int(os.getenv("MAX_COMMITS", "120"))
+REQUEST_TIMEOUT: float = float(os.getenv("REQUEST_TIMEOUT", "180"))
+PORT: int              = int(os.getenv("PORT", "8000"))
+
+# Strict per-attempt timeout of 25s for speed and fail-fast fallback
+ATTEMPT_TIMEOUT: float = float(os.getenv("ATTEMPT_TIMEOUT", "25"))
+
 _API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 if not API_KEY:
@@ -81,25 +83,132 @@ if not API_KEY:
         "No API key found. Set GEMINI_API_KEY or GEMMA_API_KEY in backend/.env"
     )
 
+# ─── Multi-provider / Multi-model fallback chain ─────────────────────────────
+
+PROVIDER_CHAIN: list[dict[str, Any]] = [
+    {"provider": "google", "model_id": _PRIMARY_MODEL}
+]
+
+# Google AI Studio fallback: "models/gemma-4-31b-it"
+_GOOGLE_FALLBACK = "models/gemma-4-31b-it"
+if _GOOGLE_FALLBACK != _PRIMARY_MODEL:
+    PROVIDER_CHAIN.append({"provider": "google", "model_id": _GOOGLE_FALLBACK})
+
+# Keep MODEL_CHAIN in sync for backward compatibility
+MODEL_CHAIN: list[str] = [item["model_id"] for item in PROVIDER_CHAIN]
+
+# Track discovered models count for health endpoint
+OPENROUTER_MODELS_DISCOVERED: int = 0
+
+log.info(
+    "Model chain configured: %s",
+    " → ".join(f"[{i}] {m}" for i, m in enumerate(MODEL_CHAIN)),
+)
+
+# ─── Preprocessing cache ──────────────────────────────────────────────────────
+
+_PREPROCESS_CACHE: OrderedDict[str, PreprocessResult] = OrderedDict()
+_PREPROCESS_CACHE_MAX = 5
+
+
+def _get_or_preprocess(git_log: str) -> PreprocessResult:
+    key = hashlib.md5(git_log.encode(), usedforsecurity=False).hexdigest()
+    if key in _PREPROCESS_CACHE:
+        _PREPROCESS_CACHE.move_to_end(key)
+        log.info("Preprocessor cache hit (key=%s…)", key[:8])
+        return _PREPROCESS_CACHE[key]
+
+    result = preprocess_full(git_log, max_commits=MAX_COMMITS)
+    _PREPROCESS_CACHE[key] = result
+    if len(_PREPROCESS_CACHE) > _PREPROCESS_CACHE_MAX:
+        evicted_key, _ = _PREPROCESS_CACHE.popitem(last=False)
+        log.debug("Evicted preprocessor cache entry %s…", evicted_key[:8])
+    return result
+
 
 # ─── App lifespan — shared httpx client ───────────────────────────────────────
 
+async def discover_openrouter_models() -> list[str]:
+    """
+    Query OpenRouter at startup to discover available Gemma models,
+    filtering and sorting by quality preference:
+      - google/gemma-2-27b-it
+      - google/gemma-2-9b-it
+      - Any other Gemma models
+    """
+    if not OPENROUTER_API_KEY:
+        log.warning("OPENROUTER_API_KEY not set. Skipping dynamic OpenRouter discovery.")
+        return []
+
+    url = "https://openrouter.ai/api/v1/models"
+    try:
+        log.info("Fetching available models from OpenRouter...")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.get(url, headers={"Authorization": f"Bearer {OPENROUTER_API_KEY}"})
+            if resp.status_code != 200:
+                log.error("OpenRouter models discovery API returned HTTP %d: %s", resp.status_code, resp.text[:200])
+                return []
+            
+            data = resp.json()
+            models_list = data.get("data", [])
+            gemma_models = []
+            for item in models_list:
+                m_id = item.get("id")
+                if m_id and "gemma" in m_id.lower():
+                    gemma_models.append(m_id)
+
+            # Sort intelligently: rank 1 (27b) -> 2 (9b) -> 3 (other gemma-2) -> 4 (other gemma)
+            def rank_gemma_model(model_id: str) -> int:
+                mid = model_id.lower()
+                if "gemma-2-27b" in mid:
+                    return 1
+                elif "gemma-2-9b" in mid:
+                    return 2
+                elif "gemma-2" in mid:
+                    return 3
+                return 4
+
+            gemma_models.sort(key=lambda m: (rank_gemma_model(m), m.lower()))
+            log.info("Discovered and sorted %d Gemma models on OpenRouter", len(gemma_models))
+            return gemma_models
+    except Exception as exc:
+        log.exception("Graceful fallback: OpenRouter model discovery failed")
+        return []
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """
-    Create one AsyncClient for the process lifetime.
-    Connection pooling means repeated requests reuse TCP connections,
-    which matters on weak hardware with limited file descriptors.
-    """
+    # 1. Initialize OpenRouter dynamic model discovery
+    discovered = await discover_openrouter_models()
+    
+    global OPENROUTER_MODELS_DISCOVERED
+    OPENROUTER_MODELS_DISCOVERED = len(discovered)
+    
+    for model_id in discovered:
+        # Check if already in the chain to avoid duplicates
+        if not any(item["model_id"] == model_id for item in PROVIDER_CHAIN):
+            PROVIDER_CHAIN.append({"provider": "openrouter", "model_id": model_id})
+
+    # Keep MODEL_CHAIN fully in-sync
+    global MODEL_CHAIN
+    MODEL_CHAIN.clear()
+    MODEL_CHAIN.extend([item["model_id"] for item in PROVIDER_CHAIN])
+
+    log.info(
+        "Dynamic Fallback Chain established: %s",
+        " → ".join(f"[{i}] {item['provider']}:{item['model_id']}" for i, item in enumerate(PROVIDER_CHAIN))
+    )
+
+    # 2. Setup standard client pool
     timeout = httpx.Timeout(
         connect=10.0,
-        read=REQUEST_TIMEOUT,
+        read=REQUEST_TIMEOUT,   # global safety net
         write=30.0,
         pool=5.0,
     )
     limits = httpx.Limits(
-        max_connections=10,      # safe ceiling for a laptop dev server
-        max_keepalive_connections=5,
+        max_connections=100,
+        max_keepalive_connections=50,
         keepalive_expiry=30.0,
     )
     async with httpx.AsyncClient(
@@ -109,7 +218,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         headers={"Content-Type": "application/json"},
     ) as client:
         app.state.client = client
-        log.info("HTTP client ready (model=%s timeout=%.0fs)", GEMMA_MODEL, REQUEST_TIMEOUT)
+        log.info(
+            "HTTP client ready (primary=%s chain_length=%d timeout=%.0fs)",
+            PROVIDER_CHAIN[0]["model_id"], len(PROVIDER_CHAIN), REQUEST_TIMEOUT,
+        )
         yield
     log.info("HTTP client closed")
 
@@ -117,7 +229,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
 app = FastAPI(
     title="CodeDNA API",
     description="AI Codebase Archaeologist — powered by Gemma 4",
-    version="1.0.0",
+    version="3.0.0",
     lifespan=lifespan,
 )
 
@@ -158,12 +270,7 @@ def _build_request_body(
     temperature: float = 0.2,
     max_tokens: int = 8192,
 ) -> dict[str, Any]:
-    """
-    Build the Google AI Studio generateContent request body.
-
-    Uses the systemInstruction field where the API supports it, which
-    reduces hallucination by keeping rules out of the user turn.
-    """
+    """Build the Google AI Studio generateContent request body."""
     return {
         "systemInstruction": {
             "parts": [{"text": system_prompt}]
@@ -177,11 +284,8 @@ def _build_request_body(
         "generationConfig": {
             "temperature": temperature,
             "maxOutputTokens": max_tokens,
-            # candidateCount must be 1 — we don't want multiple outputs
             "candidateCount": 1,
         },
-        # Safety: relax only the category that git commit messages might trigger.
-        # Keep all others at default (BLOCK_MEDIUM_AND_ABOVE).
         "safetySettings": [
             {
                 "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
@@ -192,15 +296,9 @@ def _build_request_body(
 
 
 def _extract_text_from_response(body: dict[str, Any]) -> str:
-    """
-    Pull the generated text from a non-streaming generateContent response.
-
-    Raises:
-        ValueError: If the response structure is unexpected or content is blocked.
-    """
+    """Pull the generated text from a non-streaming generateContent response."""
     candidates = body.get("candidates")
     if not candidates:
-        # Check for prompt feedback (blocked input)
         feedback = body.get("promptFeedback", {})
         reason   = feedback.get("blockReason", "unknown")
         raise ValueError(f"No candidates in response (blockReason={reason})")
@@ -208,7 +306,6 @@ def _extract_text_from_response(body: dict[str, Any]) -> str:
     candidate = candidates[0]
     finish    = candidate.get("finishReason", "")
 
-    # SAFETY or RECITATION finish reasons mean the output was blocked
     if finish in ("SAFETY", "RECITATION", "PROHIBITED_CONTENT"):
         raise ValueError(f"Content blocked by safety filters (finishReason={finish})")
 
@@ -216,7 +313,6 @@ def _extract_text_from_response(body: dict[str, Any]) -> str:
     if not parts:
         raise ValueError("Candidate has no content parts")
 
-    # Concatenate all text parts except thought parts (thinking models split thought vs answer)
     text = "".join(p.get("text", "") for p in parts if not p.get("thought", False))
     if not text.strip():
         raise ValueError("Model returned empty text")
@@ -225,22 +321,13 @@ def _extract_text_from_response(body: dict[str, Any]) -> str:
 
 
 def _extract_json_from_text(raw: str) -> dict[str, Any]:
-    """
-    Extract the JSON object from the model's raw text response.
-
-    Handles:
-      - Clean JSON (ideal case)
-      - ```json ... ``` fences (common Gemma quirk)
-      - Leading/trailing prose around the JSON object
-    """
+    """Extract JSON object from the model's raw text response."""
     text = raw.strip()
 
-    # Strip markdown code fences
     if text.startswith("```"):
         lines = text.splitlines()
         text  = "\n".join(lines[1:-1]).strip()
 
-    # Find the outermost { ... } — handles preamble/postamble prose
     start = text.find("{")
     end   = text.rfind("}") + 1
     if start == -1 or end == 0:
@@ -250,10 +337,7 @@ def _extract_json_from_text(raw: str) -> dict[str, Any]:
 
 
 def _classify_status(result: AnalysisResult) -> AnalysisStatus:
-    """
-    Detect PARTIAL status: any key narrative field contains 'insufficient_data'.
-    This happens legitimately with very terse commit histories.
-    """
+    """Detect PARTIAL status: any key narrative field contains 'insufficient_data'."""
     _insuf = re.compile(r"insufficient_data", re.IGNORECASE)
 
     checks = [
@@ -269,75 +353,214 @@ def _classify_status(result: AnalysisResult) -> AnalysisStatus:
     return AnalysisStatus.SUCCESS
 
 
+# ─── Single-model inference call ─────────────────────────────────────────────
+
+async def _call_model_once(
+    client: httpx.AsyncClient,
+    provider: str,
+    model_id: str,
+    sys_prompt: str,
+    user_prompt: str,
+) -> str:
+    """Make a single non-streaming generateContent or completions call."""
+    if provider == "google":
+        # Robust URL formatting that supports clean model_id as well as models/ prefixes
+        if model_id.startswith("models/"):
+            url = f"/{model_id}:generateContent"
+        else:
+            url = f"/models/{model_id}:generateContent"
+            
+        body = _build_request_body(sys_prompt, user_prompt)
+
+        try:
+            resp = await client.post(
+                url,
+                params={"key": API_KEY},
+                content=json.dumps(body),
+            )
+        except httpx.TimeoutException as exc:
+            raise asyncio.TimeoutError(
+                f"Google model {model_id} timed out (httpx)"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Network error reaching Google AI Studio: {exc}") from exc
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                detail = resp.text[:300]
+            raise RuntimeError(
+                f"Google model {model_id} returned HTTP {resp.status_code}: {detail}"
+            )
+
+        try:
+            raw_text = _extract_text_from_response(resp.json())
+        except ValueError as exc:
+            raise RuntimeError(f"Google model {model_id} gave unusable response: {exc}") from exc
+
+        return raw_text
+
+    elif provider == "openrouter":
+        if not OPENROUTER_API_KEY:
+            raise RuntimeError("OPENROUTER_API_KEY is not configured but OpenRouter was called")
+
+        url = "https://openrouter.ai/api/v1/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Content-Type": "application/json",
+            "HTTP-Referer": "http://localhost:8000",
+            "X-Title": "CodeDNA"
+        }
+        
+        body = {
+            "model": model_id,
+            "messages": [
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": user_prompt}
+            ],
+            "temperature": 0.2,
+        }
+
+        try:
+            async with httpx.AsyncClient() as or_client:
+                resp = await or_client.post(
+                    url,
+                    headers=headers,
+                    content=json.dumps(body),
+                    timeout=ATTEMPT_TIMEOUT,
+                )
+        except httpx.TimeoutException as exc:
+            raise asyncio.TimeoutError(
+                f"OpenRouter model {model_id} timed out (httpx)"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise RuntimeError(f"Network error reaching OpenRouter: {exc}") from exc
+
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("error", {}).get("message", resp.text[:300])
+            except Exception:
+                detail = resp.text[:300]
+            raise RuntimeError(
+                f"OpenRouter model {model_id} returned HTTP {resp.status_code}: {detail}"
+            )
+
+        try:
+            resp_data = resp.json()
+            choices = resp_data.get("choices", [])
+            if not choices:
+                raise ValueError("No choices in response")
+            raw_text = choices[0].get("message", {}).get("content", "")
+            if not raw_text.strip():
+                raise ValueError("OpenRouter model returned empty content")
+            return raw_text
+        except Exception as exc:
+            raise RuntimeError(f"OpenRouter model {model_id} gave unusable response: {exc}") from exc
+
+    else:
+        raise ValueError(f"Unknown provider: {provider}")
+
+
+# ─── Fallback Engine ──────────────────────────────────────────────────────────
+
+async def _call_model_with_fallback(
+    client: httpx.AsyncClient,
+    sys_prompt: str,
+    user_prompt: str,
+) -> tuple[str, str, int, str]:
+    """Try each model in PROVIDER_CHAIN in order with exponential backoff on failure."""
+    errors: list[str] = []
+    backoff_seconds = [1, 2, 3]
+
+    for level, entry in enumerate(PROVIDER_CHAIN):
+        provider = entry["provider"]
+        model_id = entry["model_id"]
+        attempt_label = f"[level={level} provider={provider} model={model_id}]"
+
+        try:
+            log.info("Attempting inference %s", attempt_label)
+
+            raw_text = await asyncio.wait_for(
+                _call_model_once(client, provider, model_id, sys_prompt, user_prompt),
+                timeout=ATTEMPT_TIMEOUT
+            )
+
+            log.info("Inference succeeded %s", attempt_label)
+            return raw_text, model_id, level, provider
+
+        except asyncio.TimeoutError:
+            msg = f"{attempt_label} timed out after {ATTEMPT_TIMEOUT:.0f}s"
+            log.warning("%s", msg)
+            errors.append(msg)
+
+        except RuntimeError as exc:
+            msg = f"{attempt_label} failed: {exc}"
+            log.warning("%s", msg)
+            errors.append(msg)
+
+        if level < len(PROVIDER_CHAIN) - 1:
+            delay = backoff_seconds[min(level, len(backoff_seconds) - 1)]
+            log.info("Backing off %.1fs before next model attempt…", delay)
+            await asyncio.sleep(delay)
+
+    error_summary = " | ".join(errors)
+    raise RuntimeError(
+        f"All {len(PROVIDER_CHAIN)} models in fallback chain failed. "
+        f"Errors: {error_summary}"
+    )
+
+
+# ─── Degraded-mode messages ───────────────────────────────────────────────────
+
+_DEGRADED_MESSAGES: dict[int, str] = {
+    1: (
+        f"Using {MODEL_CHAIN[1] if len(MODEL_CHAIN) > 1 else 'fallback model'} "
+        "due to high load on primary model. Analysis quality is slightly reduced."
+    ),
+    2: (
+        f"Using {MODEL_CHAIN[2] if len(MODEL_CHAIN) > 2 else 'fallback model'} "
+        "due to high load. Reasoning depth may be reduced."
+    ),
+}
+
+
+def _make_degraded_message(fallback_level: int) -> str | None:
+    if fallback_level == 0:
+        return None
+    if fallback_level < len(PROVIDER_CHAIN):
+        target = PROVIDER_CHAIN[fallback_level]
+        return (
+            f"Using fallback {target['model_id']} ({target['provider']}) "
+            f"due to high load on primary model. Analysis quality may vary."
+        )
+    return f"Using fallback model (level {fallback_level}). Primary model is temporarily unavailable."
+
+
 # ─── Core analysis pipeline ───────────────────────────────────────────────────
 
 async def _run_analysis(
     client: httpx.AsyncClient,
     git_log_raw: str,
-) -> tuple[AnalysisResult, int, AnalysisStatus]:
-    """
-    End-to-end pipeline for a single analysis:
-      preprocess → build prompts → call Gemma → parse → validate → classify.
-
-    Returns:
-        (AnalysisResult, commit_count, AnalysisStatus)
-
-    Raises:
-        ValueError    — bad/unrecognisable user input          (→ HTTP 400)
-        TimeoutError  — Gemma did not respond in time          (→ HTTP 504)
-        RuntimeError  — API/parse/validation failure           (→ HTTP 500)
-    """
-    t0 = time.perf_counter()
-
-    # 1. Preprocess — may raise ValueError on unrecognisable input
-    prep      = preprocess_full(git_log_raw, max_commits=MAX_COMMITS)
+) -> tuple[AnalysisResult, int, AnalysisStatus, str, int, str]:
+    # 1. Preprocess (cached)
+    prep = _get_or_preprocess(git_log_raw)
     log.info(
-        "Preprocessed: %d→%d commits | quality=%s | tokens≈%d | tiny=%s",
+        "Preprocessed: %d→%d commits | quality=%s | tokens≈%d",
         prep.total_parsed, prep.commit_count,
-        prep.quality.level, prep.estimated_tokens, prep.is_tiny_repo,
+        prep.quality.level, prep.estimated_tokens,
     )
 
-    # 2. Build prompts (system is static; user carries the git log)
+    # 2. Build prompts
     sys_prompt  = get_system_prompt()
     user_prompt = get_user_prompt(prep.formatted_log)
 
-    # 3. Call Gemma — one request, no retries (demo reliability > retry complexity)
-    url  = f"/models/{GEMMA_MODEL}:generateContent"
-    body = _build_request_body(sys_prompt, user_prompt)
+    # 3. Call Gemma Fallback Chain
+    raw_text, model_used, fallback_level, provider = await _call_model_with_fallback(
+        client, sys_prompt, user_prompt
+    )
 
-    try:
-        resp = await client.post(
-            url,
-            params={"key": API_KEY},
-            content=json.dumps(body),
-        )
-    except httpx.TimeoutException as exc:
-        raise TimeoutError(
-            f"Gemma did not respond within {REQUEST_TIMEOUT:.0f}s"
-        ) from exc
-    except httpx.RequestError as exc:
-        raise RuntimeError(f"Network error reaching Google AI Studio: {exc}") from exc
-
-    # 4. HTTP-level error handling
-    if resp.status_code != 200:
-        try:
-            detail = resp.json().get("error", {}).get("message", resp.text[:300])
-        except Exception:
-            detail = resp.text[:300]
-        raise RuntimeError(
-            f"Google AI Studio returned HTTP {resp.status_code}: {detail}"
-        )
-
-    elapsed_api = time.perf_counter() - t0
-    log.info("Gemma responded in %.1fs", elapsed_api)
-
-    # 5. Extract text
-    try:
-        raw_text = _extract_text_from_response(resp.json())
-    except ValueError as exc:
-        raise RuntimeError(str(exc)) from exc
-
-    # 6. Parse JSON
+    # 4. Parse JSON
     try:
         data = _extract_json_from_text(raw_text)
     except (ValueError, json.JSONDecodeError) as exc:
@@ -346,7 +569,7 @@ async def _run_analysis(
             f"preview: {raw_text[:300]!r}"
         ) from exc
 
-    # 7. Validate against schema (Pydantic v2)
+    # 5. Validate schema
     try:
         result = AnalysisResult.model_validate(data)
     except ValidationError as exc:
@@ -355,12 +578,7 @@ async def _run_analysis(
         ) from exc
 
     status = _classify_status(result)
-    log.info(
-        "Analysis complete: status=%s health=%d milestones=%d (%.1fs total)",
-        status, result.metadata.health_score, len(result.milestones),
-        time.perf_counter() - t0,
-    )
-    return result, prep.commit_count, status
+    return result, prep.commit_count, status, model_used, fallback_level, provider
 
 
 # ─── Endpoints ────────────────────────────────────────────────────────────────
@@ -372,11 +590,25 @@ async def _run_analysis(
     tags=["Infrastructure"],
 )
 async def health() -> HealthResponse:
-    """Returns service status, active model, and commit cap."""
+    fallback_models = [item["model_id"] for item in PROVIDER_CHAIN[1:]]
+    
+    provider_chain = [
+        ModelEntry(
+            provider=item["provider"],
+            model_id=item["model_id"],
+            level=idx
+        )
+        for idx, item in enumerate(PROVIDER_CHAIN)
+    ]
+    
     return HealthResponse(
         status="ok",
-        model=GEMMA_MODEL,
+        model=PROVIDER_CHAIN[0]["model_id"],
         max_commits=MAX_COMMITS,
+        fallback_models=fallback_models,
+        fallback_count=len(fallback_models),
+        provider_chain=provider_chain,
+        openrouter_models_discovered=OPENROUTER_MODELS_DISCOVERED,
     )
 
 
@@ -385,85 +617,66 @@ async def health() -> HealthResponse:
     response_model=AnalyzeResponse,
     summary="Analyse a git log",
     tags=["Analysis"],
-    responses={
-        400: {"model": ErrorResponse, "description": "Invalid git log"},
-        504: {"model": ErrorResponse, "description": "Gemma API timeout"},
-        500: {"model": ErrorResponse, "description": "API or parse failure"},
-    },
 )
 async def analyze(body: AnalyzeRequest, request: Request) -> AnalyzeResponse:
-    """
-    Primary analysis endpoint.
-
-    Accepts preprocessed or raw git log text.
-    Makes exactly ONE call to Gemma 4 and returns the validated result.
-    Typical latency: 10–30 s on the React public repo (400 commits).
-
-    The frontend should:
-      1. Open GET /analyze/stream for live reasoning tokens.
-      2. Simultaneously POST /analyze for the structured result.
-      3. Display the timeline once /analyze responds.
-    """
     client: httpx.AsyncClient = request.app.state.client
+    t0 = time.perf_counter()
 
     try:
-        result, commit_count, status = await _run_analysis(client, body.git_log)
+        result, commit_count, status, model_used, fallback_level, provider = (
+            await _run_analysis(client, body.git_log)
+        )
+        processing_ms = int((time.perf_counter() - t0) * 1000)
+
         return AnalyzeResponse(
             success=True,
             status=status,
             result=result,
             commits_preprocessed=commit_count,
+            processing_time_ms=processing_ms,
+            model_used=model_used,
+            fallback_level=fallback_level,
+            degraded_mode=(fallback_level > 0),
+            degraded_message=_make_degraded_message(fallback_level),
+            provider=provider,
         )
 
     except ValueError as exc:
-        # Bad user input — tell the client exactly what went wrong
         log.warning("Invalid input: %s", exc)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    except TimeoutError as exc:
-        log.error("Gemma timeout: %s", exc)
+    except asyncio.TimeoutError as exc:
+        log.error("Outer timeout: %s", exc)
         raise HTTPException(
-            status_code=504,
-            detail=str(exc),
+            status_code=540,
+            detail="All models timed out. Please try again in a moment.",
         ) from exc
 
     except RuntimeError as exc:
+        error_str = str(exc)
+        if "fallback chain failed" in error_str or "timed out" in error_str.lower():
+            log.error("All models failed: %s", exc)
+            raise HTTPException(
+                status_code=504,
+                detail=f"All models unavailable: {error_str}",
+            ) from exc
         log.error("Analysis runtime error: %s", exc)
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
+        raise HTTPException(status_code=500, detail=error_str) from exc
 
 
-@app.get(
+@app.post(
     "/analyze/stream",
-    summary="Stream Gemma 4 tokens via SSE",
+    summary="Stream Gemma 4 tokens via SSE (POST)",
     tags=["Analysis"],
 )
-async def analyze_stream(
-    git_log: str = Query(..., description="URL-encoded raw git log text"),
-    request: Request = None,  # type: ignore[assignment]
-) -> StreamingResponse:
-    """
-    Server-Sent Events endpoint.
-
-    Streams real token chunks from the Gemma streamGenerateContent endpoint.
-    The frontend ReasoningPanel connects here immediately when the user clicks
-    Analyze. Token text appears as Gemma produces it.
-
-    SSE event format:
-        data: <token text, newlines escaped as \\n>\\n\\n
-        data: [DONE]\\n\\n      — stream complete
-        data: [ERROR] <msg>\\n\\n — stream-level failure
-
-    This endpoint uses a separate HTTP request to the streaming API endpoint.
-    It runs concurrently with POST /analyze — both are initiated by the frontend
-    at the same time.
-    """
+async def analyze_stream(body: AnalyzeRequest, request: Request) -> StreamingResponse:
     client: httpx.AsyncClient = request.app.state.client
+    stream_model = MODEL_CHAIN[0]
 
     async def event_generator() -> AsyncIterator[str]:
         try:
-            # Preprocess the git log (same pipeline as /analyze)
             try:
-                prep = preprocess_full(git_log, max_commits=MAX_COMMITS)
+                prep = _get_or_preprocess(body.git_log)
             except ValueError as exc:
                 yield f"data: [ERROR] {exc}\n\n"
                 yield "data: [DONE]\n\n"
@@ -471,16 +684,19 @@ async def analyze_stream(
 
             sys_prompt  = get_system_prompt()
             user_prompt = get_user_prompt(prep.formatted_log)
-            body        = _build_request_body(sys_prompt, user_prompt)
+            req_body    = _build_request_body(sys_prompt, user_prompt)
 
-            url = f"/models/{GEMMA_MODEL}:streamGenerateContent"
+            # Adapt URL format to support clean model_id and models/ prefix
+            if stream_model.startswith("models/"):
+                url = f"/{stream_model}:streamGenerateContent"
+            else:
+                url = f"/models/{stream_model}:streamGenerateContent"
 
-            # Open a streaming HTTP connection to Google AI Studio
             async with client.stream(
                 "POST",
                 url,
                 params={"key": API_KEY, "alt": "sse"},
-                content=json.dumps(body),
+                content=json.dumps(req_body),
             ) as resp:
                 if resp.status_code != 200:
                     err = await resp.aread()
@@ -492,11 +708,7 @@ async def analyze_stream(
                     yield "data: [DONE]\n\n"
                     return
 
-                # Consume SSE lines from Google's streaming response
-                # Google sends: "data: {json}\n\n" per chunk
                 async for line in resp.aiter_lines():
-                    # Check for client disconnect — avoids keeping the Gemma
-                    # connection alive after the browser tab closes
                     if await request.is_disconnected():
                         log.info("Client disconnected — closing stream")
                         return
@@ -514,7 +726,6 @@ async def analyze_stream(
                     except json.JSONDecodeError:
                         continue
 
-                    # Extract text from this chunk
                     try:
                         parts = (
                             chunk_json
@@ -522,12 +733,14 @@ async def analyze_stream(
                             .get("content", {})
                             .get("parts", [])
                         )
-                        text = "".join(p.get("text", "") for p in parts)
+                        # Stream both thoughts and final response text for live terminal view
+                        text = "".join(
+                            p.get("text", "") for p in parts
+                        )
                     except (IndexError, AttributeError):
                         continue
 
                     if text:
-                        # Escape newlines so SSE framing (double-\n sentinel) stays intact
                         safe = text.replace("\n", "\\n")
                         yield f"data: {safe}\n\n"
 
@@ -547,6 +760,6 @@ async def analyze_stream(
         headers={
             "Cache-Control": "no-cache",
             "Connection":    "keep-alive",
-            "X-Accel-Buffering": "no",   # Disable nginx response buffering
+            "X-Accel-Buffering": "no",
         },
     )

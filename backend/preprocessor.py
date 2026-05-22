@@ -2,15 +2,15 @@
 preprocessor.py — Git log parser and token optimizer for CodeDNA.
 
 Pipeline:
-  raw text  →  parse_commits()  →  score_quality()
+  raw text  →  parse_commits()  →  slice (remove very old)
             →  compress()       →  truncate()
             →  format_for_llm() →  PreprocessResult
 
-Design goals:
-  - Maximum analytical signal per token sent to Gemma 4.
-  - Zero external dependencies beyond stdlib.
-  - Safe on weak hardware: O(n) passes, no quadratic ops.
-  - Deterministic output for the same input (no randomness).
+Aggressive performance mode features:
+  - MAX_COMMITS = 120 hard limit.
+  - Slices oldest commits immediately if over limit to avoid memory/token bloat.
+  - Aggressive compression: drops merges and collapses vague runs of >=2 commits when overloaded.
+  - Compacted metadata header with basename-only hotspots and 6-month histogram cap.
 """
 
 from __future__ import annotations
@@ -18,6 +18,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -25,14 +26,18 @@ log = logging.getLogger(__name__)
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
-MAX_COMMITS: int     = int(os.getenv("MAX_COMMITS", "400"))
+# Aggressive hard limit of 120 commits for maximum speed and API reliability
+MAX_COMMITS: int     = int(os.getenv("MAX_COMMITS", "120"))
 TINY_REPO_THRESHOLD  = 50    # commits — triggers micro-analysis label
 LOW_QUALITY_RATIO    = 0.60  # if ≥60 % of messages are vague → quality=low
 MED_QUALITY_RATIO    = 0.30  # if ≥30 % vague → quality=medium
-# Approximate chars-per-token for Gemma tokenizer (conservative estimate)
-_CHARS_PER_TOKEN     = 3.8
 
-# Commit messages that carry essentially zero analytical signal
+# Approximate chars-per-token for Gemma tokenizer
+_CHARS_PER_TOKEN     = 3.8
+# Reduced from 8 to 4 to minimize token footprint
+_HOTSPOT_TOP_N       = 4
+
+# Commit messages carrying no analytical signal
 _VAGUE_PATTERNS: re.Pattern[str] = re.compile(
     r"^\s*("
     r"fix"
@@ -71,53 +76,42 @@ _VAGUE_PATTERNS: re.Pattern[str] = re.compile(
     re.IGNORECASE,
 )
 
-# Patterns that indicate bug-fixing activity (used for ratio calculation)
 _BUG_FIX_PATTERN: re.Pattern[str] = re.compile(
     r"\b(fix|fixes|fixed|bug|hotfix|patch|revert|regression|broken|crash|error|exception)\b",
     re.IGNORECASE,
 )
 
-# Merge commit detector — these are low-signal noise in --oneline logs
 _MERGE_PATTERN: re.Pattern[str] = re.compile(
     r"^merge\s+(branch|pull\s+request|remote|tag)",
     re.IGNORECASE,
 )
 
 # ─── Commit line parsers ──────────────────────────────────────────────────────
-# git log --oneline:            <hash> <message>
-# git log --oneline --date=...: <hash> <date> <message>  (rare variant)
-# git log --format="%h %ad %s": <hash> <date> <message>
-# We extract what we can; date is optional since many paste styles omit it.
 
 _ONELINE_RE: re.Pattern[str] = re.compile(
-    r"^([0-9a-f]{5,40})"          # group 1: hash (5–40 hex chars)
-    r"(?:\s+\(.*?\))?"            # optional: ref decorations (HEAD -> main)
-    r"\s+(.*?)$",                  # group 2: remainder = date? + message
+    r"^([0-9a-f]{5,40})"          # group 1: hash
+    r"(?:\s+\(.*?\))?"            # optional: ref decorations
+    r"\s+(.*?)$",                  # group 2: remainder
     re.IGNORECASE,
 )
 
-# ISO date embedded in the remainder: "2023-04-15" or "2023-04-15T..."
 _DATE_RE: re.Pattern[str] = re.compile(
     r"\b(20\d{2}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[12]\d|3[01]))\b"
 )
 
-# --stat summary lines  ("3 files changed, 12 insertions(+), 2 deletions(-)")
 _STAT_SUMMARY_RE: re.Pattern[str] = re.compile(
     r"^\s*\d+\s+files?\s+changed",
     re.IGNORECASE,
 )
 
-# --stat file lines  ("src/App.tsx  |  42 ++---")
 _STAT_FILE_RE: re.Pattern[str] = re.compile(
-    r"^\s*[\w/.\-]+\s*\|\s*\d+"
+    r"^\s*([\w/.\-\\{}()\[\] ]+?)\s*\|\s*(\d+)",
 )
 
-# --numstat lines  ("12   4   src/App.tsx")
 _NUMSTAT_RE: re.Pattern[str] = re.compile(
     r"^\s*(\d+|-)\s+(\d+|-)\s+(.+)$"
 )
 
-# Blank/separator lines we always skip
 _BLANK_RE: re.Pattern[str] = re.compile(r"^\s*$")
 
 
@@ -126,25 +120,26 @@ _BLANK_RE: re.Pattern[str] = re.compile(r"^\s*$")
 @dataclass(slots=True)
 class ParsedCommit:
     """One commit extracted from the raw log."""
-    hash:       str
-    message:    str
-    date:       Optional[str]  = None   # "YYYY-MM-DD" if extractable
-    insertions: int            = 0
-    deletions:  int            = 0
-    files_changed: int         = 0
-    is_merge:   bool           = False
-    is_vague:   bool           = False
-    is_bug_fix: bool           = False
+    hash:          str
+    message:       str
+    date:          Optional[str]  = None   # "YYYY-MM-DD" if extractable
+    insertions:    int            = 0
+    deletions:     int            = 0
+    files_changed: int            = 0
+    files:         list[str]      = field(default_factory=list)  # filenames from --stat
+    is_merge:      bool           = False
+    is_vague:      bool           = False
+    is_bug_fix:    bool           = False
 
 
 @dataclass
 class QualityScore:
     """Commit message quality assessment for the entire log."""
-    level:        str   = "high"   # "high" | "medium" | "low"
-    vague_count:  int   = 0
-    total_count:  int   = 0
-    vague_ratio:  float = 0.0
-    bug_fix_count: int  = 0
+    level:         str   = "high"
+    vague_count:   int   = 0
+    total_count:   int   = 0
+    vague_ratio:   float = 0.0
+    bug_fix_count: int   = 0
 
     @property
     def bug_fix_ratio_pct(self) -> str:
@@ -155,18 +150,20 @@ class QualityScore:
 
 @dataclass
 class PreprocessResult:
-    """Everything the analysis pipeline needs; returned to main.py."""
-    formatted_log:   str           # compact text ready to inject into prompt
-    commit_count:    int           # how many commits reached the model
-    total_parsed:    int           # how many were in the raw log before capping
-    quality:         QualityScore
-    is_tiny_repo:    bool          # True if commit_count < TINY_REPO_THRESHOLD
-    estimated_tokens: int          # rough estimate for logging/cost awareness
-    date_range:      Optional[tuple[str, str]] = None  # (earliest, latest) YYYY-MM-DD
-    metadata_header: str           = field(default="")  # prepended to formatted_log
+    """Processed result returned to main.py."""
+    formatted_log:    str            # compact text ready to inject into prompt
+    commit_count:     int            # how many commits reached the model
+    total_parsed:     int            # how many were in the raw log before capping
+    quality:          QualityScore
+    is_tiny_repo:     bool           # True if commit_count < TINY_REPO_THRESHOLD
+    estimated_tokens: int            # rough estimate for logging/cost awareness
+    date_range:       Optional[tuple[str, str]] = None  # (earliest, latest) YYYY-MM-DD
+    metadata_header:  str            = field(default="")
+    file_hotspots:    list[tuple[str, int]] = field(default_factory=list)   # [(path, count)]
+    monthly_histogram: dict[str, int] = field(default_factory=dict)         # {YYYY-MM: count}
 
 
-# ─── Parsing ──────────────────────────────────────────────────────────────────
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _is_vague(message: str) -> bool:
     """Return True if the commit message carries no analytical signal."""
@@ -174,7 +171,6 @@ def _is_vague(message: str) -> bool:
     if len(msg) < 4:
         return True
     if msg.endswith("..."):
-        # Truncated by git log length limit — not vague, just cut off
         return False
     return bool(_VAGUE_PATTERNS.match(msg))
 
@@ -187,38 +183,33 @@ _MONTH_MAP: dict[str, str] = {
 
 
 def _parse_any_date(text: str) -> Optional[str]:
-    """Extract and format the date string, supporting both ISO format and standard git format."""
-    # 1. Try ISO date format first
+    """Extract and normalize a date string from any common git log format."""
     iso_m = _DATE_RE.search(text)
     if iso_m:
         return iso_m.group(1)
-    
-    # 2. Try standard git date format: "Wed Mar 11 16:32:00 2026 -0400"
     m = re.search(
         r"\b(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+(\d{1,2})\s+\d{2}:\d{2}:\d{2}\s+(\d{4})",
-        text,
-        re.IGNORECASE
+        text, re.IGNORECASE,
     )
     if m:
         month_str, day_str, year_str = m.group(1), m.group(2), m.group(3)
         day_str = f"0{day_str}" if len(day_str) == 1 else day_str
-        month_str = month_str.capitalize()
-        month_num = _MONTH_MAP.get(month_str[:3], "01")
+        month_num = _MONTH_MAP.get(month_str.capitalize()[:3], "01")
         return f"{year_str}-{month_num}-{day_str}"
     return None
 
 
-def _extract_stat_churn(lines: list[str], start_idx: int) -> tuple[int, int, int]:
-    """
-    Scan lines immediately after a commit line for --stat churn data.
-    Returns (insertions, deletions, files_changed).
-    Stops when it hits another commit line or runs out of lines.
-    """
+def _extract_stat_churn(
+    lines: list[str], start_idx: int
+) -> tuple[int, int, int, list[str]]:
+    """Scan lines immediately after a commit line for --stat churn data."""
     insertions = deletions = files_changed = 0
+    filenames: list[str] = []
     i = start_idx
+
     while i < len(lines):
         line = lines[i]
-        # Stat summary line: "3 files changed, 12 insertions(+), 2 deletions(-)"
+
         if _STAT_SUMMARY_RE.match(line):
             ins_m = re.search(r"(\d+)\s+insertion", line)
             del_m = re.search(r"(\d+)\s+deletion",  line)
@@ -227,71 +218,72 @@ def _extract_stat_churn(lines: list[str], start_idx: int) -> tuple[int, int, int
             if del_m: deletions     = int(del_m.group(1))
             if fch_m: files_changed = int(fch_m.group(1))
             break
-        # Stat file line — count files but don't stop yet
-        if _STAT_FILE_RE.match(line):
+
+        sf = _STAT_FILE_RE.match(line)
+        if sf:
+            fname = sf.group(1).strip()
+            if fname and not fname.startswith("{") and len(fname) < 200:
+                filenames.append(fname)
             i += 1
             continue
-        # numstat line
+
         ns = _NUMSTAT_RE.match(line)
         if ns:
-            ins_s, del_s = ns.group(1), ns.group(2)
+            ins_s, del_s, fpath = ns.group(1), ns.group(2), ns.group(3).strip()
             if ins_s != "-": insertions    += int(ins_s)
             if del_s != "-": deletions     += int(del_s)
             files_changed += 1
+            if fpath and len(fpath) < 200:
+                filenames.append(fpath)
             i += 1
             continue
-        # Blank line between commits — keep scanning
+
         if _BLANK_RE.match(line):
             i += 1
             continue
-        # Hit what looks like the next commit — stop
-        break
-    return insertions, deletions, files_changed
 
+        break
+
+    return insertions, deletions, files_changed, filenames
+
+
+# ─── Parsing ──────────────────────────────────────────────────────────────────
 
 def parse_commits(raw_log: str) -> list[ParsedCommit]:
-    """
-    Parse a raw git log string into a list of ParsedCommit objects.
-
-    Supports: --oneline, --oneline --stat, --oneline --numstat,
-              --format="%h %ad %s", standard multi-line git logs (commit <hash>), and mixed pastes.
-
-    Raises:
-        ValueError: If no recognisable commit lines are found.
-    """
+    """Parse a raw git log string into a list of ParsedCommit objects."""
     lines = raw_log.splitlines()
     commits: list[ParsedCommit] = []
-    
-    # Detect if the log is in full multi-line commit format
-    has_full_commit_lines = any(re.match(r"^commit\s+[0-9a-f]{5,40}", line.strip(), re.IGNORECASE) for line in lines)
-    
+
+    has_full_commit_lines = any(
+        re.match(r"^commit\s+[0-9a-f]{5,40}", line.strip(), re.IGNORECASE)
+        for line in lines
+    )
+
     if has_full_commit_lines:
         i = 0
-        current_commit = None
-        message_lines = []
-        
+        current_commit: Optional[ParsedCommit] = None
+        message_lines: list[str] = []
+
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
-            
+
             commit_match = re.match(r"^commit\s+([0-9a-f]{5,40})", stripped, re.IGNORECASE)
             if commit_match:
-                # If there's a previous commit, save it
                 if current_commit:
                     if message_lines:
                         current_commit.message = message_lines[0]
-                    current_commit.is_merge = bool(_MERGE_PATTERN.match(current_commit.message))
-                    current_commit.is_vague = _is_vague(current_commit.message)
+                    current_commit.is_merge   = bool(_MERGE_PATTERN.match(current_commit.message))
+                    current_commit.is_vague   = _is_vague(current_commit.message)
                     current_commit.is_bug_fix = bool(_BUG_FIX_PATTERN.search(current_commit.message))
                     commits.append(current_commit)
-                
-                # Start new commit
+
                 h = commit_match.group(1).lower()
                 current_commit = ParsedCommit(hash=h, message="")
                 message_lines = []
                 i += 1
                 continue
-            
+
             if current_commit:
                 if stripped.lower().startswith("author:"):
                     i += 1
@@ -300,47 +292,56 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
                     current_commit.date = _parse_any_date(stripped)
                     i += 1
                     continue
-                
-                # Check for stat/churn lines
-                if _STAT_SUMMARY_RE.match(stripped) or _STAT_FILE_RE.match(stripped) or _NUMSTAT_RE.match(stripped):
-                    ins, dels, files = _extract_stat_churn(lines, i)
-                    current_commit.insertions = ins
-                    current_commit.deletions = dels
+
+                if (
+                    _STAT_SUMMARY_RE.match(stripped)
+                    or _STAT_FILE_RE.match(stripped)
+                    or _NUMSTAT_RE.match(stripped)
+                ):
+                    ins, dels, files, fnames = _extract_stat_churn(lines, i)
+                    current_commit.insertions    = ins
+                    current_commit.deletions     = dels
                     current_commit.files_changed = files
-                    # Skip past the processed stat lines
+                    current_commit.files.extend(fnames)
                     while i < len(lines):
                         nxt = lines[i].strip()
-                        if _STAT_SUMMARY_RE.match(nxt) or _STAT_FILE_RE.match(nxt) or _NUMSTAT_RE.match(nxt) or not nxt:
+                        if (
+                            _STAT_SUMMARY_RE.match(nxt)
+                            or _STAT_FILE_RE.match(nxt)
+                            or _NUMSTAT_RE.match(nxt)
+                            or not nxt
+                        ):
                             i += 1
                         else:
                             break
                     continue
-                
-                # Collect message line
+
                 if stripped:
                     message_lines.append(stripped)
-            
+
             i += 1
-            
+
         if current_commit:
             if message_lines:
                 current_commit.message = message_lines[0]
-            current_commit.is_merge = bool(_MERGE_PATTERN.match(current_commit.message))
-            current_commit.is_vague = _is_vague(current_commit.message)
+            current_commit.is_merge   = bool(_MERGE_PATTERN.match(current_commit.message))
+            current_commit.is_vague   = _is_vague(current_commit.message)
             current_commit.is_bug_fix = bool(_BUG_FIX_PATTERN.search(current_commit.message))
             commits.append(current_commit)
-            
+
     else:
         i = 0
         while i < len(lines):
             line = lines[i]
             stripped = line.strip()
 
-            if (not stripped
-                    or _BLANK_RE.match(stripped)
-                    or _STAT_SUMMARY_RE.match(stripped)
-                    or _STAT_FILE_RE.match(stripped)
-                    or _NUMSTAT_RE.match(stripped)):
+            if (
+                not stripped
+                or _BLANK_RE.match(stripped)
+                or _STAT_SUMMARY_RE.match(stripped)
+                or _STAT_FILE_RE.match(stripped)
+                or _NUMSTAT_RE.match(stripped)
+            ):
                 i += 1
                 continue
 
@@ -359,11 +360,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
                 message = remainder
 
             message = re.sub(r"^\(.*?\)\s*", "", message).strip()
-            ins, dels, files = _extract_stat_churn(lines, i + 1)
-
-            is_merge   = bool(_MERGE_PATTERN.match(message))
-            is_vague   = _is_vague(message)
-            is_bug_fix = bool(_BUG_FIX_PATTERN.search(message))
+            ins, dels, files, fnames = _extract_stat_churn(lines, i + 1)
 
             commits.append(ParsedCommit(
                 hash          = commit_hash,
@@ -372,9 +369,10 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
                 insertions    = ins,
                 deletions     = dels,
                 files_changed = files,
-                is_merge      = is_merge,
-                is_vague      = is_vague,
-                is_bug_fix    = is_bug_fix,
+                files         = fnames,
+                is_merge      = bool(_MERGE_PATTERN.match(message)),
+                is_vague      = _is_vague(message),
+                is_bug_fix    = bool(_BUG_FIX_PATTERN.search(message)),
             ))
             i += 1
 
@@ -391,10 +389,7 @@ def parse_commits(raw_log: str) -> list[ParsedCommit]:
 # ─── Quality scoring ──────────────────────────────────────────────────────────
 
 def score_quality(commits: list[ParsedCommit]) -> QualityScore:
-    """
-    Assess the analytical quality of the commit message corpus.
-    Merge commits are excluded from the quality calculation (they're structural noise).
-    """
+    """Assess the quality of the commit messages, excluding merges."""
     non_merge = [c for c in commits if not c.is_merge]
     total     = len(non_merge)
 
@@ -405,12 +400,11 @@ def score_quality(commits: list[ParsedCommit]) -> QualityScore:
     bug_fix_count = sum(1 for c in non_merge if c.is_bug_fix)
     vague_ratio   = vague_count / total
 
-    if vague_ratio >= LOW_QUALITY_RATIO:
-        level = "low"
-    elif vague_ratio >= MED_QUALITY_RATIO:
-        level = "medium"
-    else:
-        level = "high"
+    level = (
+        "low"    if vague_ratio >= LOW_QUALITY_RATIO else
+        "medium" if vague_ratio >= MED_QUALITY_RATIO else
+        "high"
+    )
 
     return QualityScore(
         level         = level,
@@ -421,139 +415,127 @@ def score_quality(commits: list[ParsedCommit]) -> QualityScore:
     )
 
 
+# ─── Monthly histogram ────────────────────────────────────────────────────────
+
+def build_monthly_histogram(commits: list[ParsedCommit]) -> dict[str, int]:
+    """Count commits per month YYYY-MM, sorted chronologically."""
+    monthly: Counter[str] = Counter()
+    for c in commits:
+        if c.date:
+            monthly[c.date[:7]] += 1
+    return dict(sorted(monthly.items()))
+
+
+# ─── File hotspots ────────────────────────────────────────────────────────────
+
+def extract_file_hotspots(
+    commits: list[ParsedCommit], top_n: int = _HOTSPOT_TOP_N
+) -> list[tuple[str, int]]:
+    """Aggregate file change frequencies and return top N hotspots."""
+    counts: Counter[str] = Counter()
+    for c in commits:
+        for f in set(c.files):
+            fname = f.lstrip("./").strip()
+            if fname and not fname.endswith((".png", ".jpg", ".gif", ".ico", ".woff", ".svg", ".md")):
+                counts[fname] += 1
+    return counts.most_common(top_n)
+
+
 # ─── Compression ──────────────────────────────────────────────────────────────
 
-def compress_commits(commits: list[ParsedCommit]) -> list[ParsedCommit]:
+def compress_commits(commits: list[ParsedCommit], limit_active: bool = False) -> list[ParsedCommit]:
     """
-    Reduce token waste by collapsing runs of near-identical low-signal commits.
-
-    Strategy:
-      - Consecutive merge commits → keep first, discard rest.
-      - Runs of ≥4 consecutive vague commits of the same type → keep first
-        and last, replace middle with a summary sentinel.
-      - Pure dependency-bump commits ("bump X from Y to Z") → keep one per month.
-
-    This preserves the analytical shape of the history without sending
-    hundreds of "fix" commits to the model.
+    Reduce tokens by aggressively collapsing runs of vague and merge commits.
+    
+    If limit_active is True, compresses even more aggressively:
+      - Drops merge commits entirely to save space.
+      - Collapses vague runs of 2+ (normally 4+).
     """
     if len(commits) <= 8:
-        # Tiny repo — preserve everything as-is
         return commits
 
     compressed: list[ParsedCommit] = []
     i = 0
+    vague_run_threshold = 2 if limit_active else 4
 
     while i < len(commits):
         c = commits[i]
 
-        # Collapse merge commit runs
         if c.is_merge:
+            if limit_active:
+                # Discard merge commits entirely under extreme limits to save tokens
+                i += 1
+                continue
             j = i
             while j < len(commits) and commits[j].is_merge:
                 j += 1
             run_len = j - i
             compressed.append(c)
             if run_len > 1:
-                # Insert a synthetic summary marker
                 compressed.append(ParsedCommit(
                     hash    = "0000000",
-                    message = f"[{run_len - 1} merge commits omitted]",
+                    message = f"[{run_len - 1} merges omitted]",
                     date    = c.date,
                 ))
             i = j
             continue
 
-        # Collapse vague commit runs (≥4 consecutive)
         if c.is_vague:
             j = i
             while j < len(commits) and commits[j].is_vague and not commits[j].is_merge:
                 j += 1
             run_len = j - i
-            if run_len >= 4:
-                compressed.append(commits[i])      # keep first
+            if run_len >= vague_run_threshold:
+                compressed.append(commits[i])
                 compressed.append(ParsedCommit(
                     hash    = "0000000",
-                    message = f"[{run_len - 2} similar low-signal commits omitted]",
+                    message = f"[{run_len - 1} vague commits omitted]",
                     date    = c.date,
                 ))
-                compressed.append(commits[j - 1])  # keep last
                 i = j
                 continue
 
         compressed.append(c)
         i += 1
 
-    log.debug(
-        "Compression: %d → %d commits (%.0f%% reduction)",
-        len(commits), len(compressed),
-        (1 - len(compressed) / len(commits)) * 100 if commits else 0,
-    )
     return compressed
 
 
 # ─── Truncation ───────────────────────────────────────────────────────────────
 
 def truncate_commits(commits: list[ParsedCommit], max_count: int) -> list[ParsedCommit]:
-    """
-    Cap commits to max_count, keeping the most recent (git log is newest-first).
-    Logs a warning if truncation occurs.
-    """
+    """Cap commits to max_count, keeping the newest ones."""
     if len(commits) <= max_count:
         return commits
-    log.warning(
-        "Truncating %d → %d commits (MAX_COMMITS=%d)",
-        len(commits), max_count, max_count,
-    )
     return commits[:max_count]
 
 
-# ─── Date range extraction ────────────────────────────────────────────────────
+# ─── Date range ───────────────────────────────────────────────────────────────
 
-def extract_date_range(
-    commits: list[ParsedCommit],
-) -> Optional[tuple[str, str]]:
-    """
-    Return (earliest_date, latest_date) from commits that have a date.
-    git log is newest-first, so latest = commits[0], earliest = commits[-1].
-    Returns None if no commits carry date information.
-    """
+def extract_date_range(commits: list[ParsedCommit]) -> Optional[tuple[str, str]]:
+    """Return earliest and latest commit dates (YYYY-MM-DD)."""
     dated = [c for c in commits if c.date]
     if not dated:
         return None
-    # Newest-first → latest is first element, earliest is last
-    return dated[-1].date, dated[0].date  # type: ignore[return-value]
+    return dated[-1].date, dated[0].date   # (earliest, latest)
 
 
 # ─── Formatting ───────────────────────────────────────────────────────────────
 
 def format_for_llm(commits: list[ParsedCommit], quality: QualityScore) -> str:
-    """
-    Render the commit list into a compact, high-signal text block for injection
-    into the Gemma 4 prompt.
-
-    Format per commit:
-        <hash> <date?> <message> [+ins -del Nf]?
-
-    Churn data is only appended when non-zero (it adds context for
-    identifying high-impact commits without wasting tokens on quiet ones).
-    Synthetic summary markers are passed through verbatim.
-    """
+    """Format commits into a hyper-compact layout: hash date msg [+ins -del Nf]"""
     lines: list[str] = []
 
     for c in commits:
         if c.hash == "0000000":
-            # Synthetic compression marker — pass through as-is
             lines.append(c.message)
             continue
 
         parts: list[str] = [c.hash[:7]]
-
         if c.date:
             parts.append(c.date)
-
         parts.append(c.message)
 
-        # Append churn only when it's available and non-trivial
         if c.insertions > 0 or c.deletions > 0:
             churn = f"[+{c.insertions} -{c.deletions}"
             if c.files_changed:
@@ -566,114 +548,122 @@ def format_for_llm(commits: list[ParsedCommit], quality: QualityScore) -> str:
     return "\n".join(lines)
 
 
+# ─── Reduced Metadata Header ──────────────────────────────────────────────────
+
 def _build_metadata_header(
-    total_parsed:  int,
-    commit_count:  int,
-    quality:       QualityScore,
-    is_tiny:       bool,
-    date_range:    Optional[tuple[str, str]],
+    total_parsed:      int,
+    commit_count:      int,
+    quality:           QualityScore,
+    is_tiny:           bool,
+    date_range:        Optional[tuple[str, str]],
+    monthly_histogram: dict[str, int],
+    file_hotspots:     list[tuple[str, int]],
 ) -> str:
     """
-    Build a short context header prepended to the formatted log.
-    This gives Gemma immediate orientation without wasting tokens on prose.
+    Produces an ultra-condensed header to save hundreds of input tokens.
+    Uses short tags, filters older months, and prints only file basenames.
     """
-    parts: list[str] = []
-    parts.append(f"COMMITS_TOTAL:{total_parsed}")
-    parts.append(f"COMMITS_ANALYZED:{commit_count}")
-    parts.append(f"DATA_QUALITY:{quality.level.upper()}")
-    parts.append(f"BUG_FIX_RATIO:{quality.bug_fix_ratio_pct}")
-    parts.append(f"VAGUE_RATIO:{round(quality.vague_ratio * 100)}%")
+    lines: list[str] = []
 
-    if date_range:
-        earliest, latest = date_range
-        parts.append(f"DATE_RANGE:{earliest}_to_{latest}")
-
+    earliest, latest = date_range if date_range else ("?", "?")
+    
+    # Line 1: Basic stats combined into one line
+    hdr = f"# META: {total_parsed}tot | {commit_count}ana | Q:{quality.level.upper()} | Fx:{quality.bug_fix_ratio_pct} | Vg:{round(quality.vague_ratio * 100)}% | Dates:{earliest}..{latest}"
     if is_tiny:
-        parts.append("NOTE:MICRO_REPO_UNDER_50_COMMITS")
-
+        hdr += " | TINY"
     if total_parsed > commit_count:
-        parts.append(f"NOTE:LOG_TRUNCATED_TO_{commit_count}")
+        hdr += f" | TRUNC:{commit_count}"
+    lines.append(hdr)
 
-    return "# " + " | ".join(parts)
+    # Line 2: Condensed chronological monthly counts (last 6 months only to save tokens)
+    if monthly_histogram:
+        last_months = list(monthly_histogram.items())[-6:]
+        hist_pairs = ",".join(f"{m}:{n}" for m, n in last_months)
+        lines.append(f"# MONTHS:{hist_pairs}")
+
+    # Line 3: Basename-only file hotspots (saves massive token space over full paths)
+    if file_hotspots:
+        spots = ",".join(f"{os.path.basename(f)}:{n}" for f, n in file_hotspots[:_HOTSPOT_TOP_N])
+        lines.append(f"# HOTSPOTS:{spots}")
+
+    return "\n".join(lines)
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token count estimate using a conservative chars-per-token ratio."""
     return max(1, round(len(text) / _CHARS_PER_TOKEN))
 
 
-# ─── Public entry point ───────────────────────────────────────────────────────
+# ─── Public entry points ──────────────────────────────────────────────────────
 
 def preprocess(raw_log: str, max_commits: int = MAX_COMMITS) -> tuple[str, int]:
-    """
-    Full preprocessing pipeline. Entry point called by main.py.
-
-    Args:
-        raw_log:     Raw git log text pasted or uploaded by the user.
-        max_commits: Hard cap on commits sent to the model.
-
-    Returns:
-        (formatted_log_string, commit_count)
-        where formatted_log_string is ready to inject into the Gemma prompt.
-
-    Raises:
-        ValueError: If no recognisable git commits are found in the input.
-    """
     result = preprocess_full(raw_log, max_commits)
     return result.formatted_log, result.commit_count
 
 
 def preprocess_full(raw_log: str, max_commits: int = MAX_COMMITS) -> PreprocessResult:
     """
-    Full pipeline returning the complete PreprocessResult for callers that
-    need quality scores, token estimates, or other metadata.
-
-    Pipeline:
-        parse → compress → truncate → score → date-range → format → header
+    Main preprocessing pipeline.
+    
+    Aggressive Optimization:
+      If raw_log size suggests more than max_commits, we aggressively slice the parsed 
+      array *before* performing heavy calculations, compression, or LLM formatting.
     """
     # 1. Parse
-    commits      = parse_commits(raw_log)          # raises ValueError if empty
+    commits = parse_commits(raw_log)
     total_parsed = len(commits)
 
-    # 2. Compress repetitive noise (reduces tokens before the hard cap)
-    compressed   = compress_commits(commits)
+    # 2. Aggressive Performance Fix: slice oldest commits before compressing/filtering
+    limit_active = total_parsed > max_commits
+    if limit_active:
+        commits = commits[:max_commits]  # Keep newest commits, discard older ones
 
-    # 3. Hard truncation (newest-first, keep most recent)
-    capped       = truncate_commits(compressed, max_commits)
+    # 3. Compress repetitive noise
+    compressed = compress_commits(commits, limit_active=limit_active)
+
+    # 4. Hard truncation cap
+    capped = truncate_commits(compressed, max_commits)
     commit_count = len(capped)
 
-    # 4. Quality scoring (on the capped set, post-compression)
-    quality      = score_quality(capped)
+    # 5. Quality scoring (on capped set)
+    quality = score_quality(capped)
 
-    # 5. Date range
-    date_range   = extract_date_range(capped)
+    # 6. Date range
+    date_range = extract_date_range(capped)
 
-    # 6. Format for LLM
-    formatted    = format_for_llm(capped, quality)
+    # 7. Monthly histogram (capped internally to last 6 months in header)
+    monthly_hist = build_monthly_histogram(capped)
 
-    # 7. Metadata header
-    is_tiny      = commit_count < TINY_REPO_THRESHOLD
-    header       = _build_metadata_header(
-                       total_parsed, commit_count, quality, is_tiny, date_range
-                   )
-    full_log     = header + "\n" + formatted
+    # 8. File hotspots (fewer, basename-only in header)
+    hotspots = extract_file_hotspots(capped)
 
-    # 8. Token estimate
+    # 9. Format
+    formatted = format_for_llm(capped, quality)
+
+    # 10. Low-verbosity metadata header
+    is_tiny = commit_count < TINY_REPO_THRESHOLD
+    header = _build_metadata_header(
+        total_parsed, commit_count, quality, is_tiny,
+        date_range, monthly_hist, hotspots,
+    )
+    full_log = header + "\n" + formatted
+
+    # Token estimate
     estimated_tokens = estimate_tokens(full_log)
 
     log.info(
-        "Preprocessing complete: %d raw → %d capped commits | "
-        "quality=%s | tokens≈%d | tiny=%s",
-        total_parsed, commit_count, quality.level, estimated_tokens, is_tiny,
+        "Preprocessor: %d raw -> %d capped | Q=%s | Tokens~%d | limit_active=%s",
+        total_parsed, commit_count, quality.level, estimated_tokens, limit_active
     )
 
     return PreprocessResult(
-        formatted_log    = full_log,
-        commit_count     = commit_count,
-        total_parsed     = total_parsed,
-        quality          = quality,
-        is_tiny_repo     = is_tiny,
-        estimated_tokens = estimated_tokens,
-        date_range       = date_range,
-        metadata_header  = header,
+        formatted_log     = full_log,
+        commit_count      = commit_count,
+        total_parsed      = total_parsed,
+        quality           = quality,
+        is_tiny_repo      = is_tiny,
+        estimated_tokens  = estimated_tokens,
+        date_range        = date_range,
+        metadata_header   = header,
+        file_hotspots     = hotspots,
+        monthly_histogram = monthly_hist,
     )

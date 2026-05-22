@@ -10,7 +10,7 @@ export default defineConfig({
   ],
   server: {
     port: 5173,
-    // Proxy API calls to the FastAPI backend so CORS is never an issue in dev
+    // Proxy API calls to the FastAPI backend — eliminates CORS in dev
     proxy: {
       '/analyze': {
         target: 'http://localhost:8000',
@@ -21,5 +21,18 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  build: {
+    // Separate vendor chunk (react + react-dom) from app code.
+    // Improves cache hit rate: app changes don't re-download ~140KB of React.
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          vendor: ['react', 'react-dom'],
+        },
+      },
+    },
+    // Inline small assets (<8KB) directly rather than separate network requests
+    assetsInlineLimit: 8192,
   },
 })
